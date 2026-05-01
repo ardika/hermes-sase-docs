@@ -1,0 +1,45 @@
+title: Hermes Network 360 Guard — Panduan Refactor SASE (WireGuard)
+description: Dokumentasi arsitektur dan implementasi SASE berbasis WireGuard yang terkelola untuk aplikasi desktop Hermes Network 360 Guard
+remote_theme: just-the-docs/just-the-docs
+
+baseurl: "/hermes-sase-docs"
+url: "https://ardika.github.io"
+
+search_enabled: true
+search:
+  heading_level: 3
+  previews: 3
+  preview_words_before: 5
+  preview_words_after: 10
+  tokenizer_separator: /[\s\-/]+/
+  rel_url: true
+  button: false
+
+heading_anchors: true
+
+aux_links:
+  "Hermes Network Inc. di GitHub":
+    - "https://github.com/Hermes-Network-Inc"
+  "Panduan TRMM Integration":
+    - "https://ardika.github.io/hermes-trmm-docs/"
+
+footer_content: |
+  <small>Dokumentasi internal — Hermes Network Inc. &copy; 2026.<br>
+  Dibuat untuk tim teknik yang mengelola Hermes Network 360 Guard desktop client.</small>
+
+color_scheme: dark
+enable_copy_code_button: true
+
+mermaid:
+  version: "10.9.0"
+
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor/
+  - node_modules/
+  - README.md
