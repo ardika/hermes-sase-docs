@@ -18,263 +18,115 @@ permalink: /docs/config-service/
 
 ## 5.1 Tujuan
 
-`SaseConfigClient` adalah komponen di UI app yang **membaca konfigurasi WireGuard per-user** dari Supabase `user_data`. Karena Supabase yang dipakai self-hosted (tidak ada Edge Function), kita pakai **PostgREST query langsung** dengan RLS sebagai trust boundary.
+`SaseConfigClient` adalah komponen di UI app yang **membaca konfigurasi WireGuard per-user** dari Supabase `user_data.configuration`. Karena Supabase yang dipakai self-hosted (tidak ada Edge Function), kita pakai **PostgREST query langsung** dengan RLS.
+
+> **PENTING:** Schema Supabase **TIDAK BOLEH DIUBAH**. Kita pakai kolom yang sudah ada di production:
+> - `user_data.configuration` (text) — full WireGuard INI string
+> - `user_data.assigned_ip`, `sase_slice_id`, `sase_version` (informational)
+> - RLS yang sudah aktif (`uid() = uid`) — auto-filter ke row user yang login
 
 **Prinsip:**
+1. **Read-only dari client** untuk semua kolom — admin tooling yang populate `configuration`.
+2. **Tidak generate keypair di client** — admin sudah pre-generate dan stuff `PrivateKey` di dalam `configuration`.
+3. **Tidak ada write-back** dari client ke `user_data` — disiplin di kode (RLS sebenarnya allow, tapi kita tidak pakai).
+4. **JWT user di header** — RLS otomatis filter ke row user.
 
-1. **Read-only dari client** untuk `wg_config` — populated by ops/admin di luar scope dokumen ini
-2. **Write-only `wg_public_key` + `wg_last_handshake`** — client report-back untuk audit
-3. **RLS enforce** semua akses — user hanya bisa lihat/edit row sendiri
-4. **JWT user di header** — tiap request carry user identity, bukan API key privileged
+## 5.2 Realitas schema production
 
-## 5.2 Schema yang dipakai
-
-Diasumsikan tabel `user_data` sudah ada di Supabase Anda. Kalau belum punya kolom yang dibutuhkan, jalankan migration:
-
-```sql
-ALTER TABLE user_data
-  ADD COLUMN IF NOT EXISTS wg_config TEXT,
-  ADD COLUMN IF NOT EXISTS wg_public_key TEXT,
-  ADD COLUMN IF NOT EXISTS wg_last_handshake TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS wg_status TEXT;
-
-ALTER TABLE user_data ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY IF NOT EXISTS "users_select_own"
-  ON user_data FOR SELECT USING (auth.uid() = id);
-
-CREATE POLICY IF NOT EXISTS "users_update_own_audit_fields"
-  ON user_data FOR UPDATE USING (auth.uid() = id)
-  WITH CHECK (auth.uid() = id);
-```
-
-Untuk **mencegah client mengubah `wg_config` sendiri** (yang harusnya read-only), tambah trigger:
+Schema yang dipakai (sudah ada, tidak perlu migration):
 
 ```sql
-CREATE OR REPLACE FUNCTION protect_wg_config()
-RETURNS TRIGGER AS $$
-BEGIN
-  -- Only service_role bisa ubah wg_config
-  IF NEW.wg_config IS DISTINCT FROM OLD.wg_config
-     AND current_setting('request.jwt.claims', true)::json->>'role' != 'service_role' THEN
-    RAISE EXCEPTION 'wg_config is managed by admin only';
-  END IF;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_protect_wg_config ON user_data;
-CREATE TRIGGER trg_protect_wg_config
-  BEFORE UPDATE ON user_data FOR EACH ROW
-  EXECUTE FUNCTION protect_wg_config();
+-- Sudah ada di production. JANGAN dibuat ulang.
+-- Tabel user_data dengan 23 kolom; yang relevan:
+--
+--   uid           uuid          -- linked ke auth user via uid() = uid
+--   configuration text          -- full WG INI string (dari admin tooling)
+--   assigned_ip   text          -- IP user di tunnel (informational)
+--   sase_slice_id int4          -- slice/network di gateway
+--   sase_version  text          -- (kosong di production saat ini)
+--
+-- RLS sudah aktif dengan policy "Allow all usage":
+--   USING (uid() = uid) WITH CHECK (uid() = uid)
 ```
 
-### 5.2.1 Format `wg_config`
+### 5.2.1 Format `configuration` yang ditemukan di production
 
-Dua opsi format yang umum dipakai:
+Berdasarkan inspeksi 5 sampel real user, format `configuration` adalah:
 
-**Format A: Full INI string (recommended — paling fleksibel)**
+- **INI string WireGuard standar**, length ~220–250 byte
+- **`[Interface]` section di posisi 1** — selalu di awal
+- **Mengandung:** `PrivateKey`, `Address`, `DNS`, `[Peer]`, `PublicKey`, `Endpoint`, `AllowedIPs`
+- **TIDAK mengandung:** `PresharedKey`, `MTU`, `PersistentKeepalive`
 
-```
+Contoh struktur (nilai diredact):
+
+```ini
 [Interface]
-PrivateKey = <pre-generated-by-admin-or-placeholder>
-Address = 10.99.0.42/32
-DNS = 10.0.0.1, 1.1.1.1
-MTU = 1280
+PrivateKey = <base64-private-key-yang-pre-generated-admin>
+Address = 10.x.x.x/32
+DNS = 10.x.x.x
 
 [Peer]
-PublicKey = <gateway-pub-base64>
-PresharedKey = <psk-base64>
+PublicKey = <base64-gateway-public-key>
 Endpoint = <gateway-host>:51820
-AllowedIPs = 10.0.0.0/8, 192.168.0.0/16
-PersistentKeepalive = 25
+AllowedIPs = 0.0.0.0/0
 ```
 
-**Format B: JSON structured**
+Implikasi penting:
+- **Client tidak generate keypair sendiri** — admin yang manage. PrivateKey datang dari Supabase.
+- **Tidak ada PSK** di production — jangan asumsikan ada di kode parser/builder.
+- **Tidak ada keepalive** — kalau perlu NAT traversal, bicarakan dengan ops untuk tambah di config admin tooling, bukan di client.
 
-```json
-{
-  "interface": {
-    "privateKey": "...",
-    "address": "10.99.0.42/32",
-    "dns": "10.0.0.1",
-    "mtu": 1280
-  },
-  "peers": [{
-    "publicKey": "...",
-    "presharedKey": "...",
-    "endpoint": "...",
-    "allowedIPs": "10.0.0.0/8",
-    "persistentKeepalive": 25
-  }]
-}
-```
-
-Dokumen ini support kedua-duanya — parser di client deteksi format dari content.
-
-> **Catatan keamanan tentang PrivateKey di `wg_config`:** kalau private key WireGuard **disimpan langsung** di `wg_config` di Supabase, itu menerima trust model "admin pegang semua keys". Acceptable kalau admin = orang yang sama yang manage user, tapi sub-optimal untuk threat model production.
->
-> **Pattern yang lebih aman**: client generate keypair sendiri (`KeyStore`), publish hanya pubkey ke `user_data.wg_public_key`, admin (lewat tooling/automation) generate peer registration di gateway dan return WG config tanpa PrivateKey ke `user_data.wg_config`. Client inject local PrivateKey saat apply ke Helper. Lihat §5.5 untuk implementasi.
+> Karena PrivateKey **disimpan di Supabase**, threat model harus reflect ini. Lihat [Bab 7 — Keamanan]({{ site.baseurl }}{% link docs/07-keamanan.md %}) §7.4. Jangan duplicate PrivateKey ke disk client lebih lama dari yang dibutuhkan.
 
 ## 5.3 DTO
 
 ```csharp
 namespace HermesNetwork.Sase.Config.Models;
 
+/// <summary>Hasil read dari user_data.</summary>
 public sealed record SaseConfigDto(
-    string RawConfig,                        // INI string lengkap setelah inject PrivateKey
-    DateTimeOffset? LastUpdated,             // dari user_data.updated_at
-    string? Status                            // user_data.wg_status (kalau ada)
-);
-
-public sealed record UserDataRow(
-    string Id,
-    string? WgConfig,                        // INI atau JSON, nullable kalau belum ada
-    string? WgPublicKey,
-    DateTimeOffset? UpdatedAt
-);
+    string Configuration,             // full INI string apa adanya
+    string? AssignedIp,
+    int? SaseSliceId,
+    string? SaseVersion);
 ```
 
-## 5.4 KeyStore (per-device WireGuard keypair)
+Tidak ada `PrivateKey`, `Peers`, atau struktur parsed — kita **passthrough INI string apa adanya** ke Helper. Helper yang akan tulis ke disk WireGuard.
 
-Sama seperti pattern di TRMM docs — keypair di-generate sekali per device, simpan dengan DPAPI/Keychain.
-
-```csharp
-using System.Diagnostics;
-using System.IO;
-using System.Security.Cryptography;
-using System.Text.Json;
-
-namespace HermesNetwork.Sase.Config;
-
-public sealed class KeyStore
-{
-    private readonly string _path;
-
-    public KeyStore()
-    {
-        var dir = OperatingSystem.IsWindows()
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                           "HermesNetwork360Guard", "Sase")
-            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                           "Library", "Application Support", "HermesNetwork360Guard", "Sase");
-        Directory.CreateDirectory(dir);
-        _path = Path.Combine(dir, "keypair.json");
-    }
-
-    public async Task<KeyPair> GetOrCreateAsync()
-    {
-        var existing = await LoadAsync();
-        if (existing is not null) return existing;
-
-        var (priv, pub) = await GenerateAsync();
-        var pair = new KeyPair(priv, pub, DateTimeOffset.UtcNow);
-        await SaveAsync(pair);
-        return pair;
-    }
-
-    private async Task<KeyPair?> LoadAsync()
-    {
-        if (!File.Exists(_path)) return null;
-        var data = await File.ReadAllBytesAsync(_path);
-
-        if (OperatingSystem.IsWindows())
-        {
-            var clear = ProtectedData.Unprotect(data, null, DataProtectionScope.CurrentUser);
-            return JsonSerializer.Deserialize<KeyPair>(clear);
-        }
-        return JsonSerializer.Deserialize<KeyPair>(data);
-    }
-
-    private async Task SaveAsync(KeyPair pair)
-    {
-        var json = JsonSerializer.SerializeToUtf8Bytes(pair);
-        if (OperatingSystem.IsWindows())
-        {
-            var enc = ProtectedData.Protect(json, null, DataProtectionScope.CurrentUser);
-            await File.WriteAllBytesAsync(_path, enc);
-        }
-        else
-        {
-            await File.WriteAllBytesAsync(_path, json);
-            File.SetUnixFileMode(_path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        }
-    }
-
-    private static async Task<(string Priv, string Pub)> GenerateAsync()
-    {
-        var wg = OperatingSystem.IsWindows()
-            ? @"C:\Program Files\WireGuard\wg.exe"
-            : "/usr/local/bin/wg";
-
-        var priv = (await RunAsync(wg, "genkey")).Trim();
-        var pub  = (await RunWithStdinAsync(wg, "pubkey", priv)).Trim();
-        return (priv, pub);
-    }
-
-    private static async Task<string> RunAsync(string file, string args)
-    {
-        var psi = new ProcessStartInfo(file, args)
-        {
-            RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
-        };
-        using var p = Process.Start(psi)!;
-        var stdout = await p.StandardOutput.ReadToEndAsync();
-        await p.WaitForExitAsync();
-        return stdout;
-    }
-
-    private static async Task<string> RunWithStdinAsync(string file, string args, string stdin)
-    {
-        var psi = new ProcessStartInfo(file, args)
-        {
-            RedirectStandardInput = true, RedirectStandardOutput = true,
-            UseShellExecute = false, CreateNoWindow = true,
-        };
-        using var p = Process.Start(psi)!;
-        await p.StandardInput.WriteAsync(stdin);
-        p.StandardInput.Close();
-        var stdout = await p.StandardOutput.ReadToEndAsync();
-        await p.WaitForExitAsync();
-        return stdout;
-    }
-
-    public sealed record KeyPair(string PrivateKey, string PublicKey, DateTimeOffset GeneratedAt);
-}
-```
-
-## 5.5 SaseConfigClient
+## 5.4 SaseConfigClient (full implementation)
 
 ```csharp
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
+using HermesNetwork.Sase.Config.Models;
 
 namespace HermesNetwork.Sase.Config;
 
 public interface ISaseConfigClient
 {
+    /// <summary>Return raw INI WireGuard config dari user_data.configuration.</summary>
     Task<string> GetConfigAsync(CancellationToken ct = default);
-    Task ReportStatusAsync(string status, DateTimeOffset? lastHandshake, CancellationToken ct = default);
+
+    /// <summary>Return DTO dengan kolom tambahan untuk telemetry/debug.</summary>
+    Task<SaseConfigDto> GetFullAsync(CancellationToken ct = default);
 }
 
 public sealed class SaseConfigClient : ISaseConfigClient
 {
     private readonly HttpClient _http;
-    private readonly KeyStore _keyStore;
     private readonly Func<string> _userJwtProvider;
     private readonly string _supabaseUrl;
     private readonly string _anonKey;
 
     public SaseConfigClient(
         HttpClient http,
-        KeyStore keyStore,
         Func<string> userJwtProvider,
         string supabaseUrl,
         string anonKey)
     {
         _http = http;
-        _keyStore = keyStore;
         _userJwtProvider = userJwtProvider;
         _supabaseUrl = supabaseUrl.TrimEnd('/');
         _anonKey = anonKey;
@@ -282,9 +134,18 @@ public sealed class SaseConfigClient : ISaseConfigClient
 
     public async Task<string> GetConfigAsync(CancellationToken ct = default)
     {
-        // 1. Read user_data via PostgREST (RLS filter ke row user)
-        var req = new HttpRequestMessage(HttpMethod.Get,
-            $"{_supabaseUrl}/rest/v1/user_data?select=id,wg_config,wg_public_key&limit=1");
+        var dto = await GetFullAsync(ct);
+        return dto.Configuration;
+    }
+
+    public async Task<SaseConfigDto> GetFullAsync(CancellationToken ct = default)
+    {
+        // RLS auto-filter ke row user dari JWT, jadi tidak perlu WHERE id=...
+        var url = $"{_supabaseUrl}/rest/v1/user_data" +
+                  "?select=configuration,assigned_ip,sase_slice_id,sase_version" +
+                  "&limit=1";
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
         req.Headers.Add("apikey", _anonKey);
         req.Headers.Add("Authorization", $"Bearer {_userJwtProvider()}");
 
@@ -293,203 +154,108 @@ public sealed class SaseConfigClient : ISaseConfigClient
 
         var rows = await resp.Content.ReadFromJsonAsync<UserDataRow[]>(cancellationToken: ct);
         if (rows is null || rows.Length == 0)
-            throw new InvalidOperationException("user_data row not found for current user");
-        var row = rows[0];
-
-        if (string.IsNullOrWhiteSpace(row.WgConfig))
             throw new InvalidOperationException(
-                "wg_config kosong di user_data. Hubungi admin untuk provisioning.");
+                "user_data row not found untuk current user. " +
+                "Pastikan user sudah login dan punya row di Supabase.");
 
-        // 2. Get / create local keypair
-        var keypair = await _keyStore.GetOrCreateAsync();
+        var row = rows[0];
+        if (string.IsNullOrWhiteSpace(row.Configuration))
+            throw new InvalidOperationException(
+                "user_data.configuration kosong. " +
+                "Hubungi admin untuk provisioning WG config.");
 
-        // 3. Kalau public key di-server beda dengan keypair lokal → write back
-        if (row.WgPublicKey != keypair.PublicKey)
-        {
-            await UpdatePublicKeyAsync(row.Id, keypair.PublicKey, ct);
-        }
+        // Sanity check: pastikan minimal ada [Interface] dan [Peer]
+        if (!row.Configuration.Contains("[Interface]") ||
+            !row.Configuration.Contains("[Peer]"))
+            throw new InvalidOperationException(
+                "user_data.configuration tidak terlihat seperti WireGuard INI. " +
+                $"Length={row.Configuration.Length}, prefix=\"{row.Configuration[..Math.Min(40, row.Configuration.Length)]}\"");
 
-        // 4. Parse + inject PrivateKey lokal
-        var configIni = NormalizeToIni(row.WgConfig);
-        var withPrivateKey = InjectPrivateKey(configIni, keypair.PrivateKey);
-        return withPrivateKey;
-    }
-
-    public async Task ReportStatusAsync(
-        string status, DateTimeOffset? lastHandshake, CancellationToken ct = default)
-    {
-        var jwt = _userJwtProvider();
-        // Cara cepat: PATCH user_data row sendiri (RLS allow)
-        var req = new HttpRequestMessage(HttpMethod.Patch,
-            $"{_supabaseUrl}/rest/v1/user_data?id=eq.{await GetUserIdFromJwt(ct)}")
-        {
-            Content = JsonContent.Create(new
-            {
-                wg_status = status,
-                wg_last_handshake = lastHandshake
-            })
-        };
-        req.Headers.Add("apikey", _anonKey);
-        req.Headers.Add("Authorization", $"Bearer {jwt}");
-        req.Headers.Add("Prefer", "return=minimal");
-        using var resp = await _http.SendAsync(req, ct);
-        resp.EnsureSuccessStatusCode();
-    }
-
-    private async Task UpdatePublicKeyAsync(string userId, string pubkey, CancellationToken ct)
-    {
-        var req = new HttpRequestMessage(HttpMethod.Patch,
-            $"{_supabaseUrl}/rest/v1/user_data?id=eq.{userId}")
-        {
-            Content = JsonContent.Create(new { wg_public_key = pubkey })
-        };
-        req.Headers.Add("apikey", _anonKey);
-        req.Headers.Add("Authorization", $"Bearer {_userJwtProvider()}");
-        req.Headers.Add("Prefer", "return=minimal");
-        using var resp = await _http.SendAsync(req, ct);
-        resp.EnsureSuccessStatusCode();
-    }
-
-    private async Task<string> GetUserIdFromJwt(CancellationToken ct)
-    {
-        // Decode JWT payload (tidak verify; hanya read sub claim)
-        var jwt = _userJwtProvider();
-        var parts = jwt.Split('.');
-        if (parts.Length < 2) throw new InvalidOperationException("Invalid JWT");
-        var payload = parts[1].Replace('-', '+').Replace('_', '/');
-        switch (payload.Length % 4) { case 2: payload += "=="; break; case 3: payload += "="; break; }
-        var json = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(payload));
-        using var doc = System.Text.Json.JsonDocument.Parse(json);
-        return doc.RootElement.GetProperty("sub").GetString()!;
-    }
-
-    /// <summary>Convert format JSON → INI kalau perlu, atau return as-is kalau sudah INI.</summary>
-    private static string NormalizeToIni(string raw)
-    {
-        var trimmed = raw.TrimStart();
-        if (trimmed.StartsWith("[Interface]")) return raw;   // already INI
-        if (trimmed.StartsWith("{"))
-        {
-            // JSON → INI
-            using var doc = System.Text.Json.JsonDocument.Parse(raw);
-            return JsonToIni(doc.RootElement);
-        }
-        throw new InvalidOperationException("Unknown wg_config format");
-    }
-
-    private static string JsonToIni(System.Text.Json.JsonElement root)
-    {
-        var sb = new System.Text.StringBuilder();
-        var iface = root.GetProperty("interface");
-        sb.AppendLine("[Interface]");
-        sb.AppendLine($"Address = {iface.GetProperty("address").GetString()}");
-        if (iface.TryGetProperty("dns", out var dns))
-            sb.AppendLine($"DNS = {dns.GetString()}");
-        if (iface.TryGetProperty("mtu", out var mtu))
-            sb.AppendLine($"MTU = {mtu.GetInt32()}");
-        sb.AppendLine();
-
-        foreach (var p in root.GetProperty("peers").EnumerateArray())
-        {
-            sb.AppendLine("[Peer]");
-            sb.AppendLine($"PublicKey = {p.GetProperty("publicKey").GetString()}");
-            if (p.TryGetProperty("presharedKey", out var psk))
-                sb.AppendLine($"PresharedKey = {psk.GetString()}");
-            sb.AppendLine($"Endpoint = {p.GetProperty("endpoint").GetString()}");
-            sb.AppendLine($"AllowedIPs = {p.GetProperty("allowedIPs").GetString()}");
-            if (p.TryGetProperty("persistentKeepalive", out var ka))
-                sb.AppendLine($"PersistentKeepalive = {ka.GetInt32()}");
-            sb.AppendLine();
-        }
-        return sb.ToString();
-    }
-
-    /// <summary>
-    /// Sisipkan PrivateKey ke section [Interface]. Kalau sudah ada PrivateKey
-    /// (mis. admin pre-populate), replace dengan local key.
-    /// </summary>
-    private static string InjectPrivateKey(string ini, string privateKey)
-    {
-        var lines = ini.Split('\n').ToList();
-        var ifaceIdx = lines.FindIndex(l => l.TrimStart().StartsWith("[Interface]"));
-        if (ifaceIdx < 0)
-            throw new InvalidOperationException("No [Interface] section");
-
-        var existingPkIdx = -1;
-        for (int i = ifaceIdx + 1; i < lines.Count && !lines[i].TrimStart().StartsWith("["); i++)
-        {
-            if (lines[i].TrimStart().StartsWith("PrivateKey"))
-            {
-                existingPkIdx = i; break;
-            }
-        }
-        var newLine = $"PrivateKey = {privateKey}";
-        if (existingPkIdx >= 0) lines[existingPkIdx] = newLine;
-        else lines.Insert(ifaceIdx + 1, newLine);
-
-        return string.Join("\n", lines);
+        return new SaseConfigDto(
+            Configuration:  row.Configuration,
+            AssignedIp:     row.AssignedIp,
+            SaseSliceId:    row.SaseSliceId,
+            SaseVersion:    row.SaseVersion);
     }
 
     private sealed record UserDataRow(
-        [property: JsonPropertyName("id")]            string Id,
-        [property: JsonPropertyName("wg_config")]     string? WgConfig,
-        [property: JsonPropertyName("wg_public_key")] string? WgPublicKey
+        [property: JsonPropertyName("configuration")]   string? Configuration,
+        [property: JsonPropertyName("assigned_ip")]     string? AssignedIp,
+        [property: JsonPropertyName("sase_slice_id")]   int? SaseSliceId,
+        [property: JsonPropertyName("sase_version")]    string? SaseVersion
     );
 }
 ```
 
-## 5.6 Subscribe Realtime (opsional)
+**Yang dihapus dari versi sebelumnya:**
+- ❌ `KeyStore` class — tidak generate keypair di client
+- ❌ `KeyPairGenerator` — tidak panggil `wg genkey`
+- ❌ `DeviceIdHelper` — tidak butuh device ID untuk write ke `wg_public_key` (kolomnya pun tidak ada)
+- ❌ `ConfigRequestDto` — tidak post ke Edge Function
+- ❌ `JsonToIni()` parser — admin selalu populate INI, bukan JSON
+- ❌ `InjectPrivateKey()` — admin sudah include PrivateKey di `configuration`
+- ❌ `UpdatePublicKeyAsync()` — tidak write back ke Supabase
+- ❌ `ReportStatusAsync()` — kolom `wg_status` / `wg_last_handshake` tidak ada; gunakan app log lokal saja
+- ❌ Interaksi dengan Edge Function — tidak ada Edge Function di self-hosted
 
-Kalau Realtime aktif di Supabase self-hosted, subscribe ke `user_data` row sendiri untuk dapat push update saat admin ubah `wg_config`:
+## 5.5 Polling refresh (Realtime tidak available)
+
+Karena Realtime di self-hosted Supabase tidak aktif, gunakan **polling tiap 5 menit** di `ConnectionService` background monitor untuk detect perubahan config:
 
 ```csharp
-using Supabase.Realtime;
+// di SaseConnectionService.MonitorLoopAsync (lihat Bab 6)
+var lastConfigCheck = DateTime.UtcNow;
+var lastConfigHash = ComputeHash(currentConfig);
 
-public sealed class SaseConfigRealtimeListener : IAsyncDisposable
+while (!ct.IsCancellationRequested)
 {
-    private readonly Supabase.Client _supabase;
-    private RealtimeChannel? _channel;
+    await Task.Delay(TimeSpan.FromSeconds(20), ct);
 
-    public event Action? ConfigUpdated;
+    // ... status check existing ...
 
-    public SaseConfigRealtimeListener(Supabase.Client supabase) { _supabase = supabase; }
-
-    public async Task StartAsync(string userId)
+    if (DateTime.UtcNow - lastConfigCheck > TimeSpan.FromMinutes(5))
     {
-        _channel = _supabase.Realtime.Channel("realtime", "public", "user_data",
-            filter: $"id=eq.{userId}");
-        _channel.AddPostgresChangeHandler(
-            Supabase.Realtime.PostgresChanges.PostgresChangesOptions.ListenType.Updates,
-            (_, change) => ConfigUpdated?.Invoke());
-        await _channel.Subscribe();
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        if (_channel is not null) await _channel.Unsubscribe();
+        lastConfigCheck = DateTime.UtcNow;
+        try
+        {
+            var fresh = await _config.GetConfigAsync(ct);
+            var freshHash = ComputeHash(fresh);
+            if (freshHash != lastConfigHash)
+            {
+                _log.LogInformation("Config changed, applying new config");
+                await _helper.ApplyConfigAsync(TunnelName, fresh, ct);
+                await _helper.StartTunnelAsync(TunnelName, ct);   // restart utk apply
+                lastConfigHash = freshHash;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Config refresh check failed");
+        }
     }
 }
+
+static string ComputeHash(string s) =>
+    Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(
+        System.Text.Encoding.UTF8.GetBytes(s)));
 ```
 
-Fallback kalau Realtime tidak available: polling tiap 5 menit query `wg_config` lalu compare.
-
-## 5.7 Setup di Avalonia DI
+## 5.6 Setup di Avalonia DI
 
 ```csharp
 // di Program.cs / App startup
-services.AddHttpClient<ISaseConfigClient, SaseConfigClient>();
-services.AddSingleton<KeyStore>();
-
+services.AddHttpClient();
 services.AddSingleton<ISaseConfigClient>(sp =>
     new SaseConfigClient(
         sp.GetRequiredService<IHttpClientFactory>().CreateClient(),
-        sp.GetRequiredService<KeyStore>(),
         () => sp.GetRequiredService<SupabaseSession>().AccessToken!,
         Configuration["HNGUARD_SUPABASE_URL"]!,
         Configuration["HNGUARD_SUPABASE_ANON_KEY"]!));
 ```
 
-## 5.8 Test integration
+`SupabaseSession` adalah kelas existing di Hermes (atau wrapper minimal) yang expose `AccessToken` JWT user yang sedang login.
+
+## 5.7 Test integration
 
 ```bash
 # 1. Login user test, dapat JWT
@@ -497,22 +263,39 @@ JWT=$(curl -X POST "$SB_URL/auth/v1/token?grant_type=password" \
   -H "apikey: $ANON" -H "Content-Type: application/json" \
   -d '{"email":"test@hermes","password":"..."}' | jq -r .access_token)
 
-# 2. Read user_data
-curl "$SB_URL/rest/v1/user_data?select=*" \
+# 2. Read user_data — RLS otomatis filter ke row user
+curl "$SB_URL/rest/v1/user_data?select=configuration,assigned_ip,sase_slice_id,sase_version&limit=1" \
   -H "apikey: $ANON" -H "Authorization: Bearer $JWT" | jq
-
-# 3. Test parser di .NET
-dotnet run --project HermesNetwork.SaseConfigTest
-# (test program manual yang panggil GetConfigAsync, print output)
+# Expected:
+# [{
+#   "configuration": "[Interface]\nPrivateKey = ...\nAddress = ...\nDNS = ...\n[Peer]\nPublicKey = ...\nEndpoint = ...\nAllowedIPs = ...\n",
+#   "assigned_ip": "...",
+#   "sase_slice_id": 21,
+#   "sase_version": ""
+# }]
 ```
 
-## 5.9 Best practices
+```csharp
+// 3. Test di .NET
+var dto = await _configClient.GetFullAsync();
+dto.Configuration.Should().Contain("[Interface]");
+dto.Configuration.Should().Contain("[Peer]");
+dto.Configuration.Should().Contain("PrivateKey");
+dto.Configuration.Should().Contain("PublicKey");
+dto.Configuration.Should().Contain("Endpoint");
+dto.Configuration.Should().Contain("AllowedIPs");
+// PSK / MTU / Keepalive optional — jangan assert harus ada
+```
 
-- **Cache config di memory** setelah read pertama; refresh on-demand atau via Realtime, bukan tiap operasi
-- **Inject PrivateKey paling akhir** — pastikan key tidak masuk ke log apa pun
-- **Sanitize log message** kalau dump config — redact `PrivateKey`, `PresharedKey` lines
-- **Handle network error gracefully** — kalau Supabase tidak reachable, pakai cached config terakhir kalau ada
-- **Validate INI sebelum kirim ke Helper** — lebih baik fail early daripada Helper reject
+## 5.8 Best practices
+
+- **Cache config di memory** setelah read pertama (di `SaseConnectionService`); refresh on-demand atau via polling 5 menit, bukan tiap operasi.
+- **Hash config (SHA-256)** untuk detect perubahan tanpa harus banding string panjang.
+- **Sanitize log message** — JANGAN log `configuration` content (mengandung PrivateKey).
+- **Handle network error gracefully** — kalau Supabase tidak reachable, pakai cached config terakhir kalau ada.
+- **Validate INI minimal** — `[Interface]` + `[Peer]` ada — sebelum kirim ke Helper.
+- **Treat config sebagai opaque blob** dari sudut pandang client — admin yang berhak ubah, client cuma baca + apply.
+- **Jangan tulis fallback default values** untuk PSK/MTU/Keepalive di kode — kalau admin populate, akan otomatis terapply; kalau tidak, biarkan WireGuard pakai default.
 
 ---
 

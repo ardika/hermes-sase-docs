@@ -103,6 +103,8 @@ public sealed class SaseConnectionService : ISaseConnectionService, IAsyncDispos
     public IObservable<SaseConnectionState> StateChanges => _stateSubject;
     public SaseConnectionState CurrentState => _stateSubject.Value;
 
+    private string? _lastConfigHash;
+
     public SaseConnectionService(
         IHelperServiceClient helper,
         ISaseConfigClient config,
@@ -113,6 +115,10 @@ public sealed class SaseConnectionService : ISaseConnectionService, IAsyncDispos
             new SaseConnectionState(SaseStatus.Disconnected, null, 0, 0));
     }
 
+    private static string ComputeHash(string s) =>
+        Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(s)));
+
     public async Task<ConnectionResult> ConnectAsync(CancellationToken ct = default)
     {
         SetState(SaseStatus.Connecting);
@@ -121,8 +127,9 @@ public sealed class SaseConnectionService : ISaseConnectionService, IAsyncDispos
             // 1. Verify Helper alive
             await _helper.PingAsync(ct);
 
-            // 2. Get config dari Supabase
+            // 2. Get config dari Supabase user_data.configuration (passthrough INI)
             var configIni = await _config.GetConfigAsync(ct);
+            _lastConfigHash = ComputeHash(configIni);
 
             // 3. Apply ke Helper (uninstall + reinstall tunnel di Win)
             await _helper.ApplyConfigAsync(TunnelName, configIni, ct);
@@ -136,8 +143,8 @@ public sealed class SaseConnectionService : ISaseConnectionService, IAsyncDispos
             SetState(SaseStatus.Connected, lastHandshake: hs);
             _log.LogInformation("SASE connected, handshake at {HS}", hs);
 
-            // 6. Report status ke Supabase
-            await _config.ReportStatusAsync("connected", hs, ct);
+            // 6. Tidak ada ReportStatusAsync — kolom wg_status / wg_last_handshake
+            //    tidak ada di schema production. Status dilog di app log lokal saja.
 
             // 7. Start background monitor
             StartMonitor();
@@ -147,7 +154,7 @@ public sealed class SaseConnectionService : ISaseConnectionService, IAsyncDispos
         catch (TimeoutException)
         {
             SetState(SaseStatus.Faulted, error: "Handshake timeout");
-            await _config.ReportStatusAsync("handshake-timeout", null, ct);
+            // (skip Supabase report — kolom status tidak ada di schema production)
             return ConnectionResult.HandshakeTimeout;
         }
         catch (HelperRpcException rx)
@@ -170,7 +177,7 @@ public sealed class SaseConnectionService : ISaseConnectionService, IAsyncDispos
         try
         {
             await _helper.StopTunnelAsync(TunnelName, ct);
-            await _config.ReportStatusAsync("disconnected", null, ct);
+            // (skip Supabase report — kolom status tidak ada di schema production)
         }
         finally
         {
@@ -295,22 +302,31 @@ public sealed class SaseConnectionService : ISaseConnectionService, IAsyncDispos
                     SetState(status, st.LastHandshake, st.BytesReceived, st.BytesSent);
                 }
 
-                // Periodic report ke Supabase
-                if (st.State == "Up")
-                {
-                    try
-                    {
-                        await _config.ReportStatusAsync("connected", st.LastHandshake, ct);
-                    }
-                    catch { /* report tidak fatal */ }
-                }
+                // (skip periodic Supabase report — kolom status tidak ada
+                //  di schema production. App log lokal sudah cukup untuk audit.)
 
-                // Periodic config refresh check
+                // Periodic config refresh check (Realtime tidak aktif → polling)
                 if (DateTime.UtcNow - lastConfigCheck > TimeSpan.FromMinutes(ConfigCheckIntervalMinutes))
                 {
                     lastConfigCheck = DateTime.UtcNow;
-                    // Untuk simple: refresh tiap interval
-                    await RefreshConfigAsync(ct);
+                    try
+                    {
+                        var fresh = await _config.GetConfigAsync(ct);
+                        var freshHash = ComputeHash(fresh);
+                        if (freshHash != _lastConfigHash)
+                        {
+                            _log.LogInformation("Config changed in user_data, applying");
+                            await _helper.ApplyConfigAsync(TunnelName, fresh, ct);
+                            await _helper.StartTunnelAsync(TunnelName, ct);
+                            var hs = await WaitHandshakeAsync(TimeSpan.FromSeconds(15), ct);
+                            SetState(SaseStatus.Connected, lastHandshake: hs);
+                            _lastConfigHash = freshHash;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "Config refresh check failed (non-fatal)");
+                    }
                 }
             }
             catch (OperationCanceledException) { /* shutdown */ }
@@ -389,8 +405,7 @@ sequenceDiagram
         HS-->>HC: { state: "Up", lastHandshake: ... }
     end
 
-    CS->>SCC: ReportStatusAsync("connected", hs)
-    SCC->>SB: PATCH user_data SET wg_status, wg_last_handshake
+    Note over CS,SB: Tidak ada PATCH ke user_data — kolom status<br/>tidak ada di schema production. Audit di app log lokal.
     CS-->>UI: ConnectionResult.Connected
     UI-->>U: ✅ "Connected"
 ```

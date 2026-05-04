@@ -24,20 +24,21 @@ Manfaat:
 - Rollback gampang (toggle flag)
 - VPN user tidak interrupted selama migrasi
 - Bisa bertahap per-OS
-- Tim paralel: backend (schema migration) + frontend (helper service + UI integration)
+- Tim paralel: ops (sign-off konfirmasi schema existing) + frontend (helper service + UI integration)
 
 ## 10.2 Phase overview
 
+> **PENTING:** Tidak ada phase schema migration. Schema Supabase **dilarang diubah** — implementasi pakai kolom existing (`uid`, `configuration`, `assigned_ip`, `sase_slice_id`, `sase_version`) dan RLS yang sudah aktif.
+
 | Phase | Durasi | Aktivitas | Hasil |
 |---|---|---|---|
-| **0** | 1 minggu | Audit code SASE existing + schema `user_data` | Mapping IPC → tujuan baru, schema disetujui |
-| **1** | 1 minggu | Schema migration `user_data` + RLS policy | DB ready di staging |
-| **2** | 2 minggu | Implementasi `HermesHelperSvc` (Win + Mac) | Build + install standalone, ter-test |
-| **3** | 1 minggu | Implementasi `HelperServiceClient` + `SaseConfigClient` | Standalone test, belum integrate UI |
-| **4** | 1 minggu | `SaseConnectionService` + UI binding | Tab SASE dengan flag `UseNewSaseStack=true` |
-| **5** | 2 minggu | Beta + 100% rollout | Production users di arsitektur baru |
-| **6** | 1 minggu | Cleanup IpcComService SASE-related | Surface area bersih |
-| **Total** | **~9 minggu** | | Production fully migrated |
+| **0** | 1 minggu | Audit code SASE existing + verifikasi schema `user_data` production | Mapping IPC → tujuan baru, format `configuration` confirmed |
+| **1** | 2 minggu | Implementasi `HermesHelperSvc` (Win + Mac) | Build + install standalone, ter-test |
+| **2** | 1 minggu | Implementasi `HelperServiceClient` + `SaseConfigClient` | Standalone test, belum integrate UI |
+| **3** | 1 minggu | `SaseConnectionService` + UI binding | Tab SASE dengan flag `UseNewSaseStack=true` |
+| **4** | 2 minggu | Beta + 100% rollout | Production users di arsitektur baru |
+| **5** | 1 minggu | Cleanup IpcComService SASE-related | Surface area bersih |
+| **Total** | **~7 minggu** | | Production fully migrated |
 
 ## 10.3 Phase 0 — Audit
 
@@ -59,65 +60,45 @@ Manfaat:
    | `ConfigViewModel.cs:390` | sc query state | `_helperClient.GetStatusAsync("Hermes")` |
    | `... XDR Start` | (di luar scope SASE) | (lihat doc TRMM) |
 
-3. Verifikasi schema `user_data`:
+3. **Verifikasi schema `user_data` production (read-only — JANGAN ubah):**
 
    ```sql
-   \d user_data;
-   -- Check apakah wg_config column sudah ada
-   SELECT id, length(wg_config) FROM user_data WHERE id = '<test-user>';
+   -- Login ke Supabase SQL editor sebagai role yang punya akses read.
+   -- HARUS TIDAK ADA migration / ALTER TABLE / CREATE POLICY yang dijalankan.
+
+   -- Konfirmasi kolom yang relevan ada
+   SELECT column_name, data_type
+   FROM information_schema.columns
+   WHERE table_schema='public' AND table_name='user_data'
+     AND column_name IN ('uid','configuration','assigned_ip','sase_slice_id','sase_version');
+
+   -- Konfirmasi RLS aktif + policy "Allow all usage"
+   SELECT relrowsecurity FROM pg_class WHERE relname='user_data';
+   SELECT polname, polcmd FROM pg_policy WHERE polrelid='public.user_data'::regclass;
+
+   -- Inspect format configuration di sample user
+   SELECT length(configuration), position('[Interface]' in configuration),
+          position('[Peer]' in configuration), position('PrivateKey' in configuration)
+   FROM user_data WHERE configuration IS NOT NULL LIMIT 5;
    ```
 
-   Kalau `wg_config` belum ada / belum populated, koordinasi dengan tim ops untuk:
-   - Tambah kolom (lihat [Bab 5]({{ site.baseurl }}{% link docs/05-config-service.md %}) §5.2)
-   - Populate config untuk test users
-
-4. Dokumentasikan **format `wg_config`** di Supabase production: INI string atau JSON? Apakah include PrivateKey?
+4. Konfirmasi dengan ops:
+   - Format `configuration` adalah INI string standar WireGuard (sudah dikonfirmasi: ya)
+   - PrivateKey termasuk di `configuration` (sudah dikonfirmasi: ya)
+   - PSK / MTU / Keepalive di production (sudah dikonfirmasi: tidak ada)
+   - Realtime tidak aktif (sudah dikonfirmasi: tidak)
 
 ### Exit criteria
 
 - [ ] Mapping IPC → tujuan baru lengkap
-- [ ] Schema `user_data` ter-dokumentasi
-- [ ] Format `wg_config` confirmed dengan ops
-- [ ] Sign-off security tentang trust model (PrivateKey location, PSK rotation)
+- [ ] Schema `user_data` di-verify (TIDAK diubah)
+- [ ] Format `configuration` confirmed dengan ops
+- [ ] User test punya `configuration` ter-populate
+- [ ] Sign-off security tentang trust model (PrivateKey ada di Supabase, lihat Bab 7 §7.4)
 
-## 10.4 Phase 1 — Schema migration
+> **Phase 1 schema migration di-DROP.** Tidak ada migration yang akan dijalankan ke Supabase. Lanjut ke Phase 1 (Helper Service).
 
-### Tugas
-
-1. Apply migration ke Supabase staging:
-
-   ```sql
-   ALTER TABLE user_data
-     ADD COLUMN IF NOT EXISTS wg_public_key TEXT,
-     ADD COLUMN IF NOT EXISTS wg_status TEXT,
-     ADD COLUMN IF NOT EXISTS wg_last_handshake TIMESTAMPTZ;
-
-   ALTER TABLE user_data ENABLE ROW LEVEL SECURITY;
-
-   CREATE POLICY "users_select_own"
-     ON user_data FOR SELECT USING (auth.uid() = id);
-
-   CREATE POLICY "users_update_own"
-     ON user_data FOR UPDATE USING (auth.uid() = id)
-     WITH CHECK (auth.uid() = id);
-
-   -- Trigger protect wg_config
-   CREATE OR REPLACE FUNCTION protect_wg_config() ...;
-   CREATE TRIGGER trg_protect_wg_config ...;
-   ```
-
-2. Buat tabel `sase_audit_log` (opsional tapi recommended)
-
-3. Test akses via PostgREST dengan JWT user test
-
-### Exit criteria
-
-- [ ] Migration applied di staging
-- [ ] Test user bisa SELECT user_data sendiri
-- [ ] Test user TIDAK bisa UPDATE wg_config (trigger reject)
-- [ ] Sign-off DBA
-
-## 10.5 Phase 2 — Hermes Helper Service
+## 10.4 Phase 1 — Hermes Helper Service
 
 ### Tugas
 
@@ -150,13 +131,13 @@ Manfaat:
 - [ ] Code review approved
 - [ ] Helper signed dengan Authenticode (Win) + Developer ID (Mac)
 
-## 10.6 Phase 3 — Client side: `HelperServiceClient` + `SaseConfigClient`
+## 10.5 Phase 2 — Client side: `HelperServiceClient` + `SaseConfigClient`
 
 ### Tugas
 
 1. Buat folder `HermesNetwork/Sase/Helper/` + `HermesNetwork/Sase/Config/`
 2. Implementasi `HelperServiceClient` (named-pipe / unix-socket)
-3. Implementasi `SaseConfigClient` + `KeyStore`
+3. Implementasi `SaseConfigClient` (passthrough INI dari `user_data.configuration`; tidak ada KeyStore karena admin yang manage keypair)
 4. Test integration dengan staging Supabase + Helper di VM:
 
    ```csharp
@@ -174,10 +155,10 @@ Manfaat:
 ### Exit criteria
 
 - [ ] Standalone test panggil Supabase + Helper berhasil
-- [ ] KeyStore round-trip Win + Mac
+- [ ] PostgREST query ke `user_data` dengan JWT user mengembalikan row dengan `configuration` valid (sanity check via curl)
 - [ ] PR merged
 
-## 10.7 Phase 4 — `SaseConnectionService` + UI
+## 10.6 Phase 3 — `SaseConnectionService` + UI
 
 ### Tugas
 
@@ -197,7 +178,7 @@ Manfaat:
        services.AddSingleton<IHelperServiceClient, HelperServiceClient>();
        services.AddSingleton<ISaseConfigClient, SaseConfigClient>();
        services.AddSingleton<ISaseConnectionService, SaseConnectionService>();
-       services.AddSingleton<KeyStore>();
+       // Tidak ada KeyStore — keypair di-manage admin di user_data.configuration
    }
    else
    {
@@ -215,7 +196,7 @@ Manfaat:
 - [ ] No crash saat toggle flag
 - [ ] Network change handler bekerja
 
-## 10.8 Phase 5 — Beta + 100% rollout
+## 10.7 Phase 4 — Beta + 100% rollout
 
 ### Strategi
 
@@ -231,7 +212,7 @@ Manfaat:
 
 ### Telemetry
 
-Push event ke `sase_audit_log`:
+Push event ke app log lokal (tabel `sase_audit_log` tidak ada — schema dilarang diubah). Kalau perlu sentralisasi audit, pakai `LogReportService` yang sudah ada (lihat bab 7 §7.10):
 
 - `connect.attempt`, `connect.success`, `connect.timeout`, `connect.error`
 - `disconnect.user`, `disconnect.unexpected`
@@ -246,7 +227,7 @@ Query Supabase periodic untuk monitor.
 - [ ] Connect success rate ≥ 95%
 - [ ] No user complaint signifikan
 
-## 10.9 Phase 6 — Cleanup
+## 10.8 Phase 5 — Cleanup
 
 ### Tugas
 
@@ -273,31 +254,32 @@ Query Supabase periodic untuk monitor.
 - [ ] Release notes mention "SASE rewrite — Helper Service + Supabase user_data direct"
 - [ ] 1 minggu produksi tanpa regression
 
-## 10.10 Rollback strategy per phase
+## 10.9 Rollback strategy per phase
 
 | Phase | Rollback |
 |---|---|
-| 0 | N/A (audit) |
-| 1 | Drop columns yang ditambah (kalau possible) |
-| 2 | Uninstall Helper Service via installer; revert PR |
-| 3 | Revert PR; arsitektur lama tetap pakai IPC |
-| 4 | Toggle flag false |
-| 5 | Hot-fix release flag default false |
-| 6 | Restore dari git history |
+| 0 | N/A (audit only — tidak ada perubahan) |
+| 1 | Uninstall Helper Service via installer; revert PR |
+| 2 | Revert PR; arsitektur lama tetap pakai IPC |
+| 3 | Toggle feature flag `false` |
+| 4 | Hot-fix release flag default `false` |
+| 5 | Restore kode lama dari git history |
 
-## 10.11 Risk register
+> Tidak ada rollback DB karena tidak ada DB change.
+
+## 10.10 Risk register
 
 | Risk | Probability | Impact | Mitigation |
 |---|---|---|---|
 | Helper Service tidak terinstall di endpoint user | Medium | High | Bundle di installer, check Ping di startup |
 | Permission issue caller authentication | Medium | Medium | Comprehensive testing multi-user scenarios |
-| `wg_config` di Supabase format inkonsisten antar user | High | High | Validator + fail early dengan pesan jelas |
+| `configuration` di `user_data` format inkonsisten antar user (mis. ada user yang INI tidak valid) | Medium | High | Validator di `SaseConfigClient.GetFullAsync()` cek `[Interface]` + `[Peer]` ada; fail early dengan pesan jelas. Hubungi admin untuk fix populate. |
 | Apple Developer ID expire | Low | Critical | Calendar reminder 30 hari |
 | Conflict dengan VPN client lain (NordVPN, dll.) | Medium | Medium | Document incompatibility, detect saat startup |
 | Kill switch terlalu agresif → user lock out | Medium | High | Default soft-fail; opt-in kill switch per role |
 | Realtime subscription tidak available di self-hosted | Medium | Low | Fallback ke polling 5 menit |
 
-## 10.12 Definition of Done
+## 10.11 Definition of Done
 
 Migrasi **selesai** kalau:
 
@@ -308,7 +290,7 @@ Migrasi **selesai** kalau:
 - [ ] Onboarding doc tim engineering update
 - [ ] Tidak ada call IPC custom yang menyentuh SASE
 - [ ] Helper Service signed + notarized untuk Mac, Authenticode signed untuk Win
-- [ ] Schema `user_data` migrasi applied di production
+- [ ] **Konfirmasi: TIDAK ADA migration / `ALTER TABLE` / trigger / policy baru yang dijalankan ke Supabase production.** Schema `user_data` tetap apa adanya.
 
 ---
 

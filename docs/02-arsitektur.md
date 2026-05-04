@@ -18,11 +18,12 @@ permalink: /docs/arsitektur/
 
 ## 2.1 Constraint deployment
 
-Tiga constraint yang membentuk arsitektur ini (lihat [Bab 1]({{ site.baseurl }}{% link docs/01-pendahuluan.md %}) §1.1):
+Empat constraint yang membentuk arsitektur ini (lihat [Bab 1]({{ site.baseurl }}{% link docs/01-pendahuluan.md %}) §1.1 dan inspeksi schema production):
 
-1. **Supabase self-hosted** → tidak ada Edge Function. Komunikasi backend = direct PostgREST query (RLS) atau REST service standalone.
+1. **Supabase self-hosted** → tidak ada Edge Function. Komunikasi backend = direct PostgREST query, dilindungi RLS yang sudah aktif.
 2. **UI tidak run as admin** → operasi privileged WireGuard butuh komponen helper terpisah dengan privilege SYSTEM/root.
-3. **WG config per-user di `user_data`** → tidak ada gateway terpusat di kode; client baca config user, parse, apply via Helper.
+3. **WG config per-user di `user_data.configuration`** (text, full INI string termasuk PrivateKey, Address, DNS, Peer block) → tidak ada gateway terpusat di kode; client baca config, passthrough ke Helper apa adanya.
+4. **Schema Supabase TIDAK BOLEH DIUBAH** → kode harus pakai kolom yang sudah ada (`uid`, `configuration`, `assigned_ip`, `sase_slice_id`, `sase_version`); RLS yang sudah aktif (`uid() = uid`) auto-filter; tidak ada migration / `ALTER TABLE` / trigger baru / kolom tambahan / tabel baru yang akan dibuat.
 
 ## 2.2 Arsitektur saat ini (sebelum refactor)
 
@@ -180,14 +181,14 @@ Detail implementasi di [Bab 4 — Helper Service]({{ site.baseurl }}{% link docs
 
 ### Komponen C — `SaseConfigClient` (di UI app)
 
-**Tanggung jawab:** Baca per-user config dari Supabase `user_data`.
+**Tanggung jawab:** Baca per-user config dari Supabase `user_data.configuration`.
 
 | Yang dilakukan | Yang TIDAK dilakukan |
 |---|---|
-| `SELECT wg_config FROM user_data WHERE id = auth.uid()` | Generate WG keypair sendiri (itu di KeyStore) |
-| Parse config string → `SaseConfigDto` | Validate gateway reachable |
-| Subscribe Supabase Realtime `user_data` (opsional) | Apply config ke tunnel (itu Helper) |
-| Write public key kembali via `UPDATE` | Pegang API key privileged |
+| `GET /rest/v1/user_data?select=configuration,assigned_ip,sase_slice_id,sase_version&limit=1` (RLS auto-filter via `uid() = uid`) | Generate WG keypair sendiri (admin manage, PrivateKey ada di `configuration`) |
+| Validate INI string ada `[Interface]` & `[Peer]` | Parse / modify config (passthrough apa adanya ke Helper) |
+| Polling tiap 5 menit untuk detect perubahan (Realtime tidak aktif) | `INSERT` / `UPDATE` / `DELETE` ke `user_data` |
+| Hash config (SHA-256) untuk skip re-apply kalau sama | Pegang API key privileged |
 
 **Lokasi:**
 ```
@@ -196,10 +197,11 @@ HermesNetwork/
     └── Config/
         ├── SaseConfigClient.cs
         ├── ISaseConfigClient.cs
-        ├── KeyStore.cs                     ← per-device keypair, DPAPI/Keychain
         └── Models/
             └── SaseConfigDto.cs
 ```
+
+**Catatan:** Tidak ada `KeyStore.cs` / `KeyPairGenerator.cs` / `DeviceIdHelper.cs` — admin yang manage keypair, pre-populated di `configuration` text.
 
 Detail di [Bab 5 — Config Service]({{ site.baseurl }}{% link docs/05-config-service.md %}).
 
@@ -240,10 +242,10 @@ sequenceDiagram
     UI->>CS: ConnectAsync()
 
     CS->>SCC: GetConfigAsync()
-    SCC->>SB: SELECT wg_config FROM user_data<br/>WHERE id = auth.uid()
-    SB-->>SCC: { wg_config: "[Interface]\\n..." }
-    SCC->>SCC: Parse + inject local PrivateKey<br/>(dari KeyStore)
-    SCC-->>CS: SaseConfigDto
+    SCC->>SB: GET /rest/v1/user_data?<br/>select=configuration,assigned_ip,...<br/>(RLS auto-filter uid()=uid)
+    SB-->>SCC: { configuration: "[Interface]\\nPrivateKey=...\\n[Peer]...", ... }
+    SCC->>SCC: Validate ada [Interface] & [Peer]
+    SCC-->>CS: SaseConfigDto (passthrough INI)
 
     CS->>HC: ApplyConfig(name, content)
     HC->>HS: { jsonrpc: "2.0", method: "ApplyConfig", ... }
@@ -270,35 +272,40 @@ sequenceDiagram
 ```
 
 **Catatan:**
-- **Private key WG TIDAK pernah meninggalkan client device.** Disimpan di DPAPI/Keychain.
-- **API key SASE TIDAK ada** — gateway peer config sudah tersimpan di user_data per user, di-populate oleh ops/admin via tooling lain.
+- **PrivateKey WG ada di `user_data.configuration` di Supabase**, di-generate dan di-populate oleh admin tooling (di luar scope dokumen ini). Client tidak generate keypair lokal.
+- **API key SASE TIDAK ada di client** — gateway peer config sudah tersimpan di `user_data.configuration` per user, di-populate oleh admin lewat tooling lain.
 - Helper hanya tahu "apply config X, start tunnel Y" — tidak tahu siapa user atau apa policy.
+- Threat model konsekuensi: kalau Supabase compromise, semua PrivateKey user bocor. Lihat [Bab 7]({{ site.baseurl }}{% link docs/07-keamanan.md %}) untuk diskusi.
 
-## 2.6 Aliran data: "config refresh otomatis"
+## 2.6 Aliran data: "config refresh otomatis" (polling — Realtime tidak aktif)
+
+Realtime di Supabase self-hosted production **tidak aktif** untuk semua tabel. Refresh dilakukan dengan polling background tiap 5 menit + hash compare:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant SB as Supabase Realtime
     participant CS as ConnectionService
     participant SCC as SaseConfigClient
+    participant SB as Supabase
     participant HC as HelperClient
     participant HS as Hermes Helper
 
-    Note over CS: User connected. Background subscribe<br/>ke user_data updates via Realtime
-    SB-->>CS: { event: "UPDATE", row: { wg_config: "..." } }
-
+    Note over CS: Background timer 5 menit (saat user connected)
     CS->>SCC: GetConfigAsync()
-    SCC-->>CS: New SaseConfigDto
+    SCC->>SB: GET /rest/v1/user_data?select=configuration
+    SB-->>SCC: { configuration: "..." }
+    SCC-->>CS: INI string
+
+    CS->>CS: SHA-256 hash, banding dengan hash terakhir
+    Note over CS: Sama → no-op<br/>Beda → apply
 
     CS->>HC: ApplyConfig(name, newContent)
     HC->>HS: ApplyConfig
     HS->>HS: Replace file + restart WG service
     HS-->>HC: ok
-    Note over HS: WireGuard re-handshake otomatis<br/>(tetap connected, tidak drop UX)
 ```
 
-Untuk fallback (kalau Realtime tidak available di self-hosted Supabase): polling tiap 5 menit query `user_data` untuk cek `updated_at` change.
+Hash compare di client menghindari unnecessary tunnel restart. Polling 5 menit cukup karena admin update jarang.
 
 ## 2.7 Trade-off & rationale
 
@@ -307,7 +314,7 @@ Untuk fallback (kalau Realtime tidak available di self-hosted Supabase): polling
 | Hermes Helper Service terpisah | UAC dialog tiap operasi | UAC tiap klik = UX rusak. Helper sekali install, jalan persistent. |
 | Direct PostgREST query (no Edge Function) | Bikin REST service standalone | Self-hosted Supabase support PostgREST + RLS lengkap. Tidak perlu deploy lebih banyak. |
 | Named-pipe + JSON-RPC | gRPC, REST-over-HTTP, COM | Named-pipe = built-in OS authentication, ringan, sudah pattern di Windows. JSON-RPC = simple kontrak. |
-| Per-device keypair di-generate client | Keypair dari user_data | Private key tidak pernah leave device. Client write public key kembali via UPDATE. |
+| Keypair pre-generated admin di `user_data.configuration` | Client generate keypair lokal + publish pubkey | Realitas production: PrivateKey sudah ada di Supabase. Schema tidak boleh diubah, kolom `wg_public_key` tidak ada. Client passthrough INI apa adanya. |
 | Stateless Helper | Helper cache state | Stateless = mudah di-audit, lebih sedikit bug. |
 | Verb whitelist Helper | Generic "RunCommand" | Generic = backdoor risk. Whitelist = audit trail jelas. |
 | Tetap WireGuard | OpenZiti / Tailscale / NetBird | WireGuard sudah running, tested, fast. |
@@ -316,8 +323,9 @@ Untuk fallback (kalau Realtime tidak available di self-hosted Supabase): polling
 
 - ✅ WireGuard data plane: binary `wireguard.exe` / `wg-quick` resmi
 - ✅ Crypto WireGuard
-- ✅ Supabase `user_data` schema (kita hanya read/optional update kolom yang sudah ada)
+- ✅ **Supabase `user_data` schema** — semua 23 kolom existing tetap apa adanya. **Tidak ada migration.** Tidak ada kolom baru. Tidak ada trigger baru. Tidak ada policy baru. RLS yang sudah aktif (`uid() = uid`) cukup.
 - ✅ Tab UI Avalonia struktur
+- ✅ Admin tooling yang populate `user_data.configuration` (di luar scope dokumen ini)
 
 ## 2.9 Apa yang berubah
 
@@ -325,9 +333,15 @@ Untuk fallback (kalau Realtime tidak available di self-hosted Supabase): polling
 - ❌ Custom IPC `Code: "Z1398V"` magic strings — DIHAPUS, diganti typed JSON-RPC
 - ➕ `HermesHelperSvc/` — project baru untuk Helper Service
 - ➕ `HermesNetwork/Sase/Helper/` — client side untuk panggil Helper
-- ➕ `HermesNetwork/Sase/Config/` — Supabase user_data reader
-- ➕ Per-device WG keypair (DPAPI/Keychain)
-- 🔄 Lifecycle WireGuard: lewat Helper IPC instead of `IpcComService`
+- ➕ `HermesNetwork/Sase/Config/` — Supabase user_data reader (passthrough INI)
+- 🔄 Lifecycle WireGuard: lewat Helper IPC menggantikan `IpcComService`
+
+**Apa yang TIDAK ditambahkan** (dropped dari versi sebelumnya):
+- ~~Per-device WG keypair generation di client (DPAPI/Keychain)~~ — admin yang manage, sudah di `configuration`
+- ~~`KeyStore.cs`, `KeyPairGenerator.cs`, `DeviceIdHelper.cs`~~ — tidak perlu
+- ~~Schema migration (`ALTER TABLE`, kolom `wg_public_key`/`wg_status`/`wg_last_handshake`, trigger `protect_wg_config`, tabel `sase_peer`/`sase_audit_log`)~~ — tidak diizinkan, schema dilarang diubah
+- ~~PSK rotation~~ — production config tidak pakai PSK
+- ~~Realtime subscription~~ — tidak aktif di self-hosted, pakai polling 5 menit
 
 ---
 

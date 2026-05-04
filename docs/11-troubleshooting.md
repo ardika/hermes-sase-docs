@@ -30,7 +30,7 @@ curl https://ifconfig.me   # IP harus IP gateway
 # Kirim Ping JSON-RPC manual via test program
 
 # Supabase query test
-curl "$SUPABASE_URL/rest/v1/user_data?select=wg_config" \
+curl "$SUPABASE_URL/rest/v1/user_data?select=configuration,assigned_ip,sase_slice_id,sase_version" \
   -H "apikey: $ANON" -H "Authorization: Bearer $JWT"
 ```
 
@@ -85,7 +85,7 @@ nc -U /var/run/hermes-helper.sock < /dev/null
 | Penyebab | Cek | Fix |
 |---|---|---|
 | Firewall block UDP 51820 outbound | `nc -uvz <gateway> 51820` | Whitelist gateway endpoint |
-| Public key client tidak ter-register di gateway | Compare `wg_public_key` di Supabase ↔ pubkey di gateway peer list | Trigger re-register: clear `wg_public_key` di Supabase, reconnect |
+| PublicKey client tidak ter-register di gateway | Extract PublicKey dari `configuration` (`grep PublicKey`), compare dengan list peer di gateway dashboard | Eskalasi ke admin tooling untuk re-generate `configuration` user atau register ulang peer |
 | PSK mismatch | (tidak ada cara langsung) | Refresh config dari Supabase |
 | Endpoint IP berubah / DNS resolve gagal | `nslookup <gateway-host>` | `wg-quick down && up` (force re-resolve) |
 | MTU terlalu besar | `ping -M do -s 1372 <gw>` | Set `MTU = 1280` di config |
@@ -109,26 +109,28 @@ sudo wg-quick up /etc/wireguard/Hermes.conf
 
 | Penyebab | Cek | Fix |
 |---|---|---|
-| AllowedIPs tidak cover destination | `wg show Hermes allowed-ips` | Edit `wg_config` di Supabase |
+| AllowedIPs tidak cover destination | `wg show Hermes allowed-ips` | Eskalasi ke admin: minta admin update `user_data.configuration` user dengan AllowedIPs yang sesuai. Client tidak `UPDATE` field ini. |
 | Routing tidak ke tunnel interface | `route get 8.8.8.8` (Mac) / `Get-NetRoute` (Win) | Restart tunnel |
 | MTU drop packet | `ping -M do -s 1400 8.8.8.8` | Set MTU 1280 |
 | DNS broken | `nslookup example.com` | Verify DNS line di config |
 | Gateway-side block | Test ke IP allowed dulu | Hubungi ops |
 
-## 11.5 SaseConfigClient: "wg_config kosong"
+## 11.5 SaseConfigClient: "user_data.configuration kosong"
 
-**Gejala:** `GetConfigAsync()` throw "wg_config kosong di user_data".
+**Gejala:** `GetConfigAsync()` throw "user_data.configuration kosong" atau "tidak terlihat seperti WireGuard INI".
 
-**Penyebab:** Tabel `user_data` row user belum di-populate dengan `wg_config`.
+**Penyebab:** Row `user_data` user belum di-populate dengan `configuration` valid.
 
 **Fix:**
 
 1. Verify dengan query:
    ```sql
-   SELECT id, length(wg_config) FROM user_data WHERE id = '<user-uuid>';
+   -- read-only — JANGAN UPDATE
+   SELECT length(configuration), substring(configuration for 80) AS preview
+   FROM user_data WHERE uid = '<auth-user-uuid>';
    ```
-2. Kalau NULL → koordinasi dengan ops untuk populate config
-3. Pastikan tooling admin generate per-user config + save ke Supabase
+2. Kalau NULL atau kosong → koordinasi dengan ops untuk populate `configuration`. Client TIDAK menulis field ini.
+3. Kalau ada tapi format bukan INI WireGuard → minta ops fix admin tooling yang generate config
 
 ## 11.6 SaseConfigClient: "user_data row not found"
 
@@ -231,35 +233,25 @@ watch -n 1 'wg show Hermes latest-handshakes'
 
 Kalau manual stable tapi via app tidak → bug di logic `MonitorLoopAsync`. Tambah verbose logging.
 
-## 11.13 KeyStore corrupt (Win DPAPI)
+## 11.13 "Config refresh tidak trigger"
 
-**Gejala:** `KeyStore.LoadAsync` throw `CryptographicException`.
+**Gejala:** Admin update `user_data.configuration` di Supabase, tapi user tidak terapply.
 
 **Penyebab:**
-- File di-copy dari user lain (DPAPI tied to user account)
-- User profile rebuilt
-- Windows reinstall
-
-**Fix:** Hapus file, generate ulang.
-
-```powershell
-Remove-Item "$env:LOCALAPPDATA\HermesNetwork360Guard\Sase\keypair.json"
-# UI klik Connect lagi → generate keypair baru
-# Public key baru di-publish ke user_data → admin tooling re-register
-```
-
-## 11.14 "Config refresh tidak trigger"
-
-**Gejala:** Admin update `wg_config` di Supabase, tapi user tidak terapply.
-
-**Diagnosa:**
-- Apakah Realtime subscription aktif?
-- Apakah polling 5 menit jalan?
+- Tab SASE belum dibuka (monitor active hanya saat connected)
+- Background polling 5 menit belum jalan satu siklus
+- Hash compare detect "no change" karena admin re-write isi yang sama
+- Realtime tidak available di self-hosted production (memang tidak ada push notification)
 
 **Fix:**
-- Pastikan tab SASE dibuka (monitor active hanya saat connected)
-- Tambah broadcast notification dari trigger Supabase
-- Atau force user RefreshConfig manual
+- Pastikan tab SASE dibuka, status "Connected"
+- Force `RefreshConfigAsync` manual via tombol (atau Disconnect → Connect)
+- Verify config beda secara hash:
+  ```bash
+  curl "$SB/rest/v1/user_data?select=configuration" \
+    -H "apikey:$ANON" -H "Authorization:Bearer $JWT" | jq -r '.[0].configuration' | sha256sum
+  ```
+- Kalau hash sama → admin populate ulang dengan content yang berbeda
 
 ## 11.15 Diagnostic checklist untuk support ticket
 

@@ -25,7 +25,8 @@ Implementasi SASE di Hermes saat ini menggunakan **WireGuard** sebagai data plan
 > **Penting (terkait konteks deployment):**
 > - **Supabase yang dipakai adalah self-hosted**, sehingga fitur **Supabase Edge Functions tidak tersedia**. Komunikasi backend dilakukan langsung ke Postgres via PostgREST (RLS-protected) atau lewat REST service terpisah jika dibutuhkan logic server-side.
 > - **`HermesNetwork360Guard.exe` jalan sebagai user biasa, bukan as administrator.** Operasi privileged (install tunnel service, write config, start/stop tunnel) **harus dilakukan oleh komponen helper terpisah** yang punya privilege SYSTEM (Windows) atau root (macOS).
-> - **Tidak ada gateway SASE terpusat dengan IP/hostname tunggal.** Tiap user punya konfigurasi WireGuard sendiri — endpoint, peer pubkey, AllowedIPs — tersimpan di kolom `user_data.wg_config` (atau set kolom equivalent) di Supabase.
+> - **Tidak ada gateway SASE terpusat dengan IP/hostname tunggal.** Tiap user punya konfigurasi WireGuard sendiri — endpoint, peer pubkey, AllowedIPs, dan PrivateKey — tersimpan di kolom `user_data.configuration` (text, full WireGuard INI string) di Supabase production.
+> - **Schema Supabase TIDAK boleh diubah** dalam scope implementasi ini. Tidak ada migration, tidak ada `ALTER TABLE`, tidak ada kolom baru. Implementasi harus pakai kolom yang sudah ada.
 
 ## 1.2 Apa itu SASE?
 
@@ -107,7 +108,9 @@ State agent (online/offline) di-track di UI dan service tanpa single source of t
 
 ### 1.4.4 Tidak ada PSK (Pre-Shared Key)
 
-Config WireGuard standar saat ini tidak pakai PSK. Tanpa PSK, kalau private key bocor, attacker langsung bisa handshake. PSK = additional symmetric secret untuk defense in depth (juga future-proof terhadap quantum attack).
+Config WireGuard production saat ini tidak pakai PSK (verified dari sample 5 user real: `PresharedKey` tidak ada). Tanpa PSK, kalau private key bocor, attacker langsung bisa handshake. PSK akan menambah defense-in-depth tapi keputusan tambah PSK adalah keputusan ops + admin tooling, bukan client.
+
+Implementasi client passthrough INI apa adanya — kalau ke depan admin tambah `PresharedKey = ...` di `[Peer]` block, tidak perlu code change.
 
 ### 1.4.5 Reconnection / roaming brittle
 
@@ -129,14 +132,15 @@ Tidak ada laporan ke Supabase tentang connect time, last handshake, byte transfe
 | Config delivery | Hardcoded saat install | Read dari Supabase `user_data` saat login + on-demand refresh |
 | Privileged ops | Disebar di multiple kode IPC | Hanya di Helper Service, well-defined verbs |
 | Roaming detection | Tidak ada | Active health check + reconnect |
-| PSK | Tidak ada | Wajib untuk new config |
-| Audit log | Tidak ada | Connect events di Supabase `sase_audit_log` |
-| State source of truth | Local (drift) | Supabase user_data + helper status query |
+| PSK | Tidak ada di production | (TIDAK diubah dalam scope ini — keputusan ops kalau mau tambah PSK di admin tooling) |
+| Audit log | Tidak ada | Connect events di app log lokal + (opsional) Hermes `LogReportService` existing |
+| State source of truth | Local (drift) | `user_data.configuration` (Supabase) + helper status query |
 
 ## 1.6 Apa yang BUKAN cakupan
 
 - Setup awal gateway WireGuard (server-side WireGuard) — di-manage ops/admin
-- Provisioning per-user WG config di `user_data` (di-populate via tooling admin di luar app)
+- Provisioning per-user WG config di `user_data.configuration` (di-populate via tooling admin di luar app)
+- **Perubahan schema Supabase** — schema dilarang diubah dalam scope ini
 - NGFW / packet inspection di gateway
 - Migrasi ke teknologi VPN lain (kita **tetap pakai WireGuard**)
 - UI/UX redesign Avalonia

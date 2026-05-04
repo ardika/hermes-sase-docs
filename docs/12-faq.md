@@ -38,22 +38,27 @@ Ini essentially menggantikan ServiceEngine.exe lama, tapi dengan **scope minimal
 
 Solusi: pakai PostgREST + RLS langsung dari client. Untuk logic server-side yang lebih complex, deploy REST service standalone (FastAPI / Express / dll) terpisah.
 
-### **Kenapa `wg_config` disimpan di Supabase user_data, bukan di gateway control plane?**
+### **Kenapa konfigurasi WireGuard disimpan di Supabase `user_data.configuration`, bukan di gateway control plane?**
 
-Karena **konfigurasi WireGuard per-user sudah ada di Supabase** sebagai source of truth (existing setup). Admin/automation populate config per-user di `user_data.wg_config`, client baca dan apply.
+Karena **konfigurasi WireGuard per-user sudah ada di kolom `user_data.configuration` (text, full INI string)** sebagai source of truth (existing setup di production Hermes). Admin/automation populate config per-user, client baca dan apply via Helper.
 
-Tidak ada "central gateway" tunggal — tiap user bisa punya endpoint berbeda, AllowedIPs berbeda, PSK berbeda, dll. Semua di-define per-user di Supabase.
+Tidak ada "central gateway" tunggal yang di-hardcode di kode — tiap user bisa punya endpoint berbeda, AllowedIPs berbeda, dll. Semua di-define per-user di Supabase oleh admin tooling (di luar scope dokumen ini).
 
 ### **Bagaimana kalau client mau pakai per-device WG keypair (bukan dari Supabase)?**
 
-Itu pattern yang **lebih aman**, dan didukung di [Bab 5]({{ site.baseurl }}{% link docs/05-config-service.md %}) §5.2.1:
+Pattern itu **lebih aman secara threat model**, tapi **TIDAK didukung di scope dokumen ini** karena:
 
-1. Client generate keypair lokal (KeyStore + DPAPI/Keychain)
-2. Client publish public key ke `user_data.wg_public_key` via UPDATE
-3. Admin tooling (di luar scope client) detect new pubkey, register peer di gateway, update `wg_config` (tanpa PrivateKey)
-4. Client read config, inject PrivateKey lokal saat apply
+1. **Schema Supabase tidak boleh diubah** — kolom `wg_public_key` tidak ada di production, tidak akan ditambahkan.
+2. **Admin tooling existing menempatkan PrivateKey langsung di `configuration`** — pattern "client publish pubkey, admin re-issue" akan butuh perubahan tooling admin di luar scope.
 
-Trade-off: butuh tooling admin yang otomatis. Kalau tidak ada, fallback ke "admin pre-generate semua keypair dan stuff di wg_config" — sub-optimal tapi pragmatic.
+Implementasi client mengikuti realita production: PrivateKey datang dari Supabase, client passthrough.
+
+Kalau ke depan Hermes mau migrasi ke pattern keypair-per-device, butuh:
+- Schema change di Supabase (tambah kolom pubkey writeback)
+- Update admin tooling supaya generate config tanpa PrivateKey + register pubkey saat publish
+- Update client supaya generate keypair lokal + inject
+
+Itu adalah project terpisah, bukan bagian dokumen ini.
 
 ### **Kenapa tetap pakai WireGuard? Bukan switch ke Tailscale / NetBird / OpenZiti?**
 
@@ -131,11 +136,11 @@ Tambah ke whitelist:
 4. Tambah method di `IHelperServiceClient` di UI app
 5. Bump JSON-RPC version untuk audit trail
 
-### **Apakah perlu real-time WebSocket untuk update wg_config?**
+### **Apakah perlu real-time WebSocket untuk update `configuration`?**
 
-Phase 1: tidak perlu. Polling tiap 5 menit cukup untuk UX baik (admin update jarang).
+Tidak — di production Hermes, **Realtime tidak aktif** untuk semua tabel (verified via Supabase dashboard, semua "Realtime Enabled = ❌"). Polling tiap 5 menit cukup untuk UX baik (admin update jarang).
 
-Phase 2: kalau Realtime aktif di self-hosted Supabase, subscribe ke row `user_data` user. Trigger refresh otomatis.
+Kalau ke depan Realtime di-enable di Supabase, client bisa di-extend untuk subscribe ke row `user_data` user. Tapi itu opsional, bukan perubahan yang diperlukan saat ini.
 
 ### **Bagaimana kalau perlu support Linux?**
 
@@ -191,7 +196,7 @@ Untuk 50,000+ peer, scale horizontal: multiple gateway.
 ### **Berapa lama config refresh berlaku?**
 
 Default 24 jam (set saat config di-generate oleh admin tooling). Bisa di-tune:
-- Pendek (1 jam): rotate PSK lebih sering, lebih aman, lebih banyak admin tooling work
+- Pendek (1 jam): admin tooling refresh `configuration` lebih sering, mungkin re-issue keypair tiap jam — beban admin tooling tinggi
 - Panjang (7 hari): lebih sedikit work, kurang sering rotate
 
 Sweet spot: 24 jam.
@@ -201,8 +206,9 @@ Sweet spot: 24 jam.
 3 langkah:
 
 ```sql
--- 1. Set wg_config NULL (client refuse to connect)
-UPDATE user_data SET wg_config = NULL WHERE id = '<user-uuid>';
+-- 1. (Admin tooling) Clear configuration agar client refuse to connect
+--    NOTE: hanya admin/service_role yang melakukan ini, bukan client.
+UPDATE user_data SET configuration = NULL WHERE uid = '<auth-user-uuid>';
 ```
 
 ```bash
@@ -225,18 +231,17 @@ Untuk multi-tenant, tambah `tenant_id` di `user_data`:
 ALTER TABLE user_data ADD COLUMN tenant_id UUID;
 ```
 
-Admin tooling provision per-user config dengan gateway/AllowedIPs sesuai tenant. Client tidak perlu tahu — dia hanya read `wg_config` user-nya sendiri.
+Admin tooling provision per-user `configuration` dengan gateway/AllowedIPs sesuai tenant. Client tidak perlu tahu — dia hanya read `user_data.configuration` user-nya sendiri (RLS enforce).
 
 ## 12.4 Pertanyaan keamanan
 
-### **WireGuard sudah aman by default. Kenapa tambah PSK?**
+### **Apakah pakai PSK?**
 
-Defense in depth:
-- PSK = mitigasi kalau private key bocor
-- PSK = future-proof terhadap quantum attack pada Curve25519
-- PSK = additional symmetric secret yang mudah di-rotate
+Tidak — sample 5 user real di production menunjukkan **`PresharedKey` tidak ada** di `configuration`. Production saat ini tidak pakai PSK.
 
-Cost: ~tambah `PresharedKey = ...` di `[Peer]` section. Benefit: significant.
+PSK akan menambah defense-in-depth (mitigasi quantum, perlindungan kalau private key bocor), tapi cost tambah PSK = admin tooling harus generate + populate ke `configuration` semua user. Itu keputusan ops, bukan client.
+
+Kalau ke depan admin tooling tambah `PresharedKey = ...` di `[Peer]` section, **client otomatis support tanpa code change** — passthrough INI ke Helper, WireGuard handle PSK natively.
 
 ### **Apakah private key WG bisa di-extract dari Windows DPAPI?**
 
@@ -246,11 +251,11 @@ Hanya kalau attacker:
 
 Bukan defense terhadap state actor, tapi cukup untuk mayoritas threat.
 
-Untuk paranoid mode: store private key di TPM / Secure Enclave — future work, butuh refactor `KeyStore`.
+Untuk paranoid mode: store private key di TPM / Secure Enclave — future work, butuh perubahan admin tooling (generate keypair via TPM) plus client-side hardening. Tidak applicable sekarang karena PrivateKey datang dari Supabase.
 
 ### **Apakah ada audit log yang bocor PII?**
 
-Tabel `sase_audit_log` log:
+App log lokal (Hermes Guard `app.log`) + OS log (Event Viewer / `os_log`) berisi:
 - `user_id` (UUID)
 - `action`
 - `detail` JSONB (bisa include hostname, public_ip)
@@ -260,27 +265,31 @@ Untuk GDPR compliance, hostname bisa di-hash atau di-redact setelah retention pe
 
 ### **Apakah private key WG di Supabase aman?**
 
-**Kalau `wg_config` di Supabase include PrivateKey**, itu berarti trust model "admin yang sama yang juga manage user". Acceptable kalau admin = orang yang sama, tapi sub-optimal.
+**Production saat ini: `configuration` di Supabase include PrivateKey.** Itu berarti trust model "admin yang sama yang juga manage user". Acceptable kalau admin = orang yang sama, tapi sub-optimal dari threat model perspective.
 
-**Pattern yang lebih aman**:
+**Pattern yang lebih aman (BUKAN scope dokumen ini, butuh schema change Supabase)**:
 1. Client generate keypair sendiri
-2. Publish hanya pubkey ke `user_data.wg_public_key`
+2. Publish hanya pubkey ke kolom baru (perlu schema change)
 3. Admin tooling generate config tanpa PrivateKey
 4. Client inject PrivateKey lokal saat apply
 
 Detail di [Bab 5]({{ site.baseurl }}{% link docs/05-config-service.md %}) §5.2.1 dan [Bab 7]({{ site.baseurl }}{% link docs/07-keamanan.md %}) §7.4.
 
-### **Bisakah user lihat wg_config user lain?**
+### **Bisakah user lihat `configuration` user lain?**
 
-Tidak, kalau RLS aktif:
+Tidak. RLS sudah aktif di `user_data` production (verified):
 
 ```sql
-ALTER TABLE user_data ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "users_select_own"
-  ON user_data FOR SELECT USING (auth.uid() = id);
+-- Sudah ada di production (jangan dibuat ulang).
+-- Policy "Allow all usage" dengan rule:
+--   USING (uid() = uid)
+--   WITH CHECK (uid() = uid)
+-- 
+-- uid() = Supabase auth helper yang return auth.users.id dari JWT.
+-- Kolom user_data.uid = uuid foreign key ke auth user.
 ```
 
-Client query dengan JWT user → PostgREST filter ke row user otomatis.
+Client query dengan JWT user → PostgREST + RLS filter ke row dengan `uid` matching user otomatis.
 
 ### **Apakah Helper bisa di-eksploitasi untuk arbitrary command execution?**
 
