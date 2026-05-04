@@ -18,281 +18,310 @@ permalink: /docs/faq/
 
 ## 12.1 Pertanyaan arsitektur
 
-### **Kenapa tetap pakai WireGuard? Bukan switch ke OpenZiti / Tailscale / NetBird?**
+### **Kenapa harus ada Hermes Helper Service terpisah? Tidak bisa UI langsung manage WireGuard?**
 
-Kekuatan WireGuard:
-- Kernel-mode (Win/Linux) atau NetworkExtension-grade (Mac) — sangat cepat
-- Crypto modern, audit clean (3500 LoC)
-- Sudah running di Hermes, terbukti stabil
-- Format config sederhana, mudah di-debug
+Dua alasan:
 
-Yang ditambahkan dokumen ini = **control plane + key management** di atas WireGuard. Hasilnya: experience setara Tailscale (managed, identity-aware, auto-rotate) tanpa lock-in vendor.
+1. **`HermesNetwork360Guard.exe` jalan as user (bukan admin)** — operasi WireGuard butuh admin/root (install Win Service, write ke `C:\Program Files\WireGuard\Data\`, `sc start/stop`).
+2. **UAC dialog tiap operasi = UX rusak.** Helper sekali install (oleh installer dengan elevation), terus jalan sebagai service persistent.
 
-Migrasi data plane ke teknologi lain = scope berbeda dengan trade-off besar. Sekarang fokus refactor cara kita mengelola WireGuard.
+Ini essentially menggantikan ServiceEngine.exe lama, tapi dengan **scope minimal** (hanya verb privileged terkait WireGuard) dan **kontrak typed JSON-RPC** (bukan magic strings).
 
-### **Kenapa pakai Edge Function sebagai trust boundary, bukan langsung dari client?**
+### **Kenapa tidak pakai Edge Function seperti di TRMM docs?**
 
-Sama persis seperti alasan di TRMM:
-- API key SASE control plane = privileged, bisa register/revoke peer apa pun
-- Embed di binary client = sekali leak, semua peer di-impact
-- Edge function = key di server only, scope kerusakan terbatas
+**Supabase yang dipakai self-hosted, dan self-hosted Supabase tidak include Edge Functions.** Self-hosted hanya support:
+- GoTrue auth
+- PostgREST (direct REST ke Postgres)
+- Realtime
+- Storage
+- (Tidak ada Deno runtime untuk Edge Functions)
 
-### **Kenapa tidak pakai NetworkExtension framework di Mac?**
+Solusi: pakai PostgREST + RLS langsung dari client. Untuk logic server-side yang lebih complex, deploy REST service standalone (FastAPI / Express / dll) terpisah.
 
-NetworkExtension butuh **Special Entitlement** dari Apple yang sulit didapat untuk app enterprise kustom. Userspace `wireguard-go` + LaunchDaemon cukup untuk Hermes scale. Migrasi ke NetworkExtension = future work kalau perlu kernel-mode atau MDM-managed VPN.
+### **Kenapa `wg_config` disimpan di Supabase user_data, bukan di gateway control plane?**
 
-### **Apa yang terjadi kalau Edge Function down?**
+Karena **konfigurasi WireGuard per-user sudah ada di Supabase** sebagai source of truth (existing setup). Admin/automation populate config per-user di `user_data.wg_config`, client baca dan apply.
 
-- ❌ User baru tidak bisa connect (butuh request config)
+Tidak ada "central gateway" tunggal — tiap user bisa punya endpoint berbeda, AllowedIPs berbeda, PSK berbeda, dll. Semua di-define per-user di Supabase.
+
+### **Bagaimana kalau client mau pakai per-device WG keypair (bukan dari Supabase)?**
+
+Itu pattern yang **lebih aman**, dan didukung di [Bab 5]({{ site.baseurl }}{% link docs/05-config-service.md %}) §5.2.1:
+
+1. Client generate keypair lokal (KeyStore + DPAPI/Keychain)
+2. Client publish public key ke `user_data.wg_public_key` via UPDATE
+3. Admin tooling (di luar scope client) detect new pubkey, register peer di gateway, update `wg_config` (tanpa PrivateKey)
+4. Client read config, inject PrivateKey lokal saat apply
+
+Trade-off: butuh tooling admin yang otomatis. Kalau tidak ada, fallback ke "admin pre-generate semua keypair dan stuff di wg_config" — sub-optimal tapi pragmatic.
+
+### **Kenapa tetap pakai WireGuard? Bukan switch ke Tailscale / NetBird / OpenZiti?**
+
+WireGuard kekuatan:
+- Kernel-mode (Win/Linux), NetworkExtension-grade (Mac)
+- Crypto modern, audited
+- Sudah running di Hermes
+- Format config sederhana
+
+Yang ditambahkan refactor ini = **control plane di sisi Supabase** + **Helper Service untuk lifecycle**. Hasilnya: managed WireGuard tanpa lock-in vendor.
+
+Migrasi ke teknologi lain = scope berbeda, trade-off besar. Sekarang fokus refactor cara kita mengelola WireGuard.
+
+### **Apa yang terjadi kalau Supabase down?**
+
+- ❌ User baru tidak bisa connect (butuh read user_data)
 - ❌ Config tidak bisa di-refresh
-- ✅ Tunnel yang sudah up tetap jalan sampai TTL config (24 jam)
-- ✅ Setelah Edge Function recover, semua lanjut normal
+- ✅ Tunnel yang sudah up tetap jalan (Helper independent)
+- ✅ UI tetap menampilkan status terakhir dari Helper
 
-UI design: tampilkan banner warning kalau config expire <2 jam dan refresh gagal.
+UI design: tampilkan banner warning kalau read user_data gagal terus-menerus.
 
-### **Apa yang terjadi kalau gateway WireGuard down?**
+### **Apa yang terjadi kalau Helper crash?**
 
-- Tunnel tidak handshake, status "Faulted" di UI
-- ConnectionService coba reconnect 3 kali dengan back-off
-- Setelah itu, user harus klik Connect manual lagi
-- Edge Function masih jalan (independen dari gateway)
+- ❌ UI tidak bisa request ApplyConfig / Start / Stop
+- ✅ Tunnel yang sudah up tetap jalan (Helper hanya manage, tidak in-line dengan data path)
+- UI tampilkan banner "Helper Service not responding"
+- Auto-restart oleh systemd (Mac LaunchDaemon `KeepAlive=true`) atau Windows Service Recovery
 
-Failover gateway: ops update `SASE_GATEWAY_ENDPOINT` di Supabase secrets → user dapat endpoint baru di config refresh berikutnya.
+### **Bagaimana kalau user pindah jaringan (WiFi → 4G)?**
+
+1. WireGuard self-heal via `PersistentKeepalive` (25 detik)
+2. `NetworkChange.NetworkAddressChanged` event di UI trigger pemeriksaan handshake
+3. Kalau handshake stale > 2 menit, force `Disconnect → Connect`
+
+Detail di [Bab 6]({{ site.baseurl }}{% link docs/06-connection-flow.md %}) §6.6.
 
 ### **Apakah perlu kill switch?**
 
 Tergantung role:
-- **Executive / role sensitif**: ya, kill switch on (no traffic kecuali via tunnel)
-- **Engineer / general**: opsional, biasanya off (split-tunnel cukup)
+- **Executive / role sensitif**: ya, kill switch on
+- **Engineer / general**: opsional, biasanya off
 - **Contractor**: ya, kill switch on
 
-Default soft-fail; opt-in kill switch per role policy di Edge Function.
+Default soft-fail; opt-in kill switch per role. Implementasi via firewall rule yang Helper apply saat tunnel up. Lihat [Bab 7]({{ site.baseurl }}{% link docs/07-keamanan.md %}) §7.7.
 
 ## 12.2 Pertanyaan implementasi
 
-### **Boleh pakai library .NET WireGuard wrapper (mis. WireGuard.NET) bukan shell out ke `wg`?**
+### **Boleh pakai library .NET WireGuard wrapper bukan shell out?**
 
 Bisa, tapi:
-- Library wrapper biasanya outdated atau partial
-- Shell out ke `wg.exe` / `wg-quick` adalah path resmi WireGuard project
+- Library wrapper biasanya outdated atau partial coverage
+- Shell out ke `wireguard.exe`/`wg`/`wg-quick` adalah path resmi
 - Output `wg show dump` parse-able dan stable
 - Mengurangi NuGet dependency
 
-Hanya pakai library kalau ada kebutuhan spesifik (mis. embed userspace WireGuard ke binary tanpa external CLI).
+Hanya pakai library kalau ada kebutuhan spesifik (mis. embed userspace WireGuard tanpa external CLI).
 
-### **Bisa nggak pakai gRPC untuk Edge Function?**
+### **Boleh pakai gRPC untuk IPC UI ↔ Helper?**
 
-Supabase Edge Functions hanya support HTTP. Untuk gRPC, deploy ke Cloud Run / Fly.io / dll. Untuk scope ini, REST cukup.
+Bisa, tapi overkill. Named-pipe + JSON-RPC sudah cukup karena:
+- Kontrak verb sederhana (~6-8 method)
+- Built-in OS authentication via pipe / socket creds
+- Ringan, tidak butuh code generation tooling
+- Standard pattern di Windows untuk service ↔ user app
 
-### **Kalau Hermes deploy beberapa gateway (multi-region), bagaimana pilih yang dekat?**
+gRPC bagus untuk RPC lintas mesin / lintas bahasa. Untuk lokal IPC, named-pipe lebih simple.
 
-Edge Function bisa pilih gateway terdekat berdasarkan:
-- IP geolocation client (request `req.headers.get("x-forwarded-for")`)
-- User role / preference
-- Health check gateway
+### **Bagaimana kalau perlu verb baru di Helper (mis. enable kill switch)?**
 
-Implementasi: tambah field `gateway_pool` di env, pilih satu, return endpoint-nya.
+Tambah ke whitelist:
+1. Definisikan params record di `Program.cs` Helper
+2. Tambah handler di `JsonRpcServer.DispatchAsync`
+3. Tambah implementation di `IOsBackend` + Win/Mac
+4. Tambah method di `IHelperServiceClient` di UI app
+5. Bump JSON-RPC version untuk audit trail
 
-```typescript
-const gateways = JSON.parse(Deno.env.get("SASE_GATEWAY_POOL") || "[]");
-const closest = pickByGeo(req, gateways);
+### **Apakah perlu real-time WebSocket untuk update wg_config?**
+
+Phase 1: tidak perlu. Polling tiap 5 menit cukup untuk UX baik (admin update jarang).
+
+Phase 2: kalau Realtime aktif di self-hosted Supabase, subscribe ke row `user_data` user. Trigger refresh otomatis.
+
+### **Bagaimana kalau perlu support Linux?**
+
+`IOsBackend` adalah interface — tinggal tambah `LinuxBackend` yang pakai `systemctl` + `wg-quick`:
+
+```csharp
+public sealed class LinuxBackend : IOsBackend
+{
+    public Task StartTunnelAsync(string name, CancellationToken ct = default)
+        => RunAsync("systemctl", $"start wg-quick@{name}", ct);
+    // ...
+}
 ```
 
-### **Bisa nggak active-passive multi-tunnel (failover) di client?**
+Avalonia sudah support Linux. WireGuard juga jalan di Linux (kernel module). Tidak ada blocker, hanya scope work tambahan.
 
-WireGuard mendukung multiple peer di satu interface, tapi tidak punya built-in failover logic. Untuk active-passive:
-- Tetap 1 tunnel, 1 gateway peer
-- Edge Function pilih gateway saat config refresh
-- Kalau primary down, ops update endpoint → client refresh → switch
+### **Bagaimana cara test kalau saya tidak punya Helper di-install?**
 
-Lebih sederhana dan reliable daripada client-side failover.
+Run Helper sebagai console app di terminal admin/sudo:
 
-### **Performance overhead per tunnel?**
-
-WireGuard overhead minimal:
-- Per packet: ~32 byte header tambahan
-- CPU: 1–5% per Gbps di laptop modern (AES-NI / hardware crypto)
-- Latency: +1–3 ms (kalau gateway dekat)
-
-Untuk Hermes use case (ribuan endpoint), bottleneck ada di gateway server, bukan client.
-
-### **Apakah perlu real-time WebSocket untuk push policy update?**
-
-Phase 1: tidak. Polling 5 menit cukup.
-
-Phase 2 (kalau perlu): tambah Supabase Realtime subscription. Kalau row di `user_profiles` user X update, push notification ke desktop client → trigger refresh.
-
-```typescript
-const channel = supabase.channel('user-' + userId)
-  .on('postgres_changes', {
-    event: 'UPDATE', schema: 'public', table: 'user_profiles',
-    filter: `id=eq.${userId}`
-  }, payload => {
-    if (payload.new.sase_role !== payload.old.sase_role) {
-      triggerRefresh();
-    }
-  })
-  .subscribe();
+```powershell
+# Windows (admin terminal)
+.\publish\HermesHelperSvc.exe
 ```
+
+```bash
+# Mac (sudo)
+sudo /usr/local/bin/HermesHelperSvc
+```
+
+Di mode console, Helper tetap listen di pipe/socket. UI bisa connect normal.
 
 ## 12.3 Pertanyaan operasional
 
-### **Berapa cost untuk SASE setup ini?**
+### **Berapa cost SASE setup ini?**
 
-Cost utama:
-- Gateway VPS (4–8 vCPU, sudah ada): $40–80/bulan
-- Bandwidth: tergantung volume, mostly included
-- SASE control plane (kalau pakai vendor): $X/peer/bulan
-- Supabase Edge Function: included di plan free / pro
-- Apple Developer ID: $99/tahun
+- Gateway WireGuard VPS: $40–80/bulan (existing)
+- Supabase self-hosted: cost server existing + storage
+- Apple Developer ID: $99/tahun (untuk signing Mac Helper)
+- Authenticode cert (Win signing): $200–400/tahun
 
-Untuk 1000 endpoint dengan WireGuard self-hosted: ~$50–100/bulan.
+Untuk 1000 endpoint, cost incremental ~$30–50/bulan (signing cost amortized).
 
 ### **Berapa peer maximum per gateway?**
 
-WireGuard self-hosted di VPS 4 vCPU 8 GB RAM bisa handle ~10,000 peer dengan handshake load normal. Bottleneck biasanya bukan WireGuard, tapi:
+WireGuard self-hosted di VPS 4 vCPU 8 GB RAM bisa handle ~10,000 peer dengan handshake load normal. Bottleneck biasanya:
 - NAT table di network (gateway behind NAT)
 - DNS resolver
 - iptables rules
 
-Untuk 50,000+ peer, scale horizontal: multiple gateway, peer-aware routing.
+Untuk 50,000+ peer, scale horizontal: multiple gateway.
 
 ### **Berapa lama config refresh berlaku?**
 
-Default 24 jam (set di Edge Function). Bisa di-tune:
-- Pendek (1 jam): rotate PSK lebih sering, lebih aman, lebih banyak request
-- Panjang (7 hari): lebih sedikit request, kurang sering rotate
+Default 24 jam (set saat config di-generate oleh admin tooling). Bisa di-tune:
+- Pendek (1 jam): rotate PSK lebih sering, lebih aman, lebih banyak admin tooling work
+- Panjang (7 hari): lebih sedikit work, kurang sering rotate
 
-Sweet spot: 24 jam = balance antara security dan ops cost.
+Sweet spot: 24 jam.
 
 ### **Bagaimana revoke akses cepat (compromised user)?**
 
 3 langkah:
 
 ```sql
--- 1. Mark peer revoked di DB (Edge Function refuse return config)
-UPDATE sase_peer SET status = 'revoked' WHERE user_id = '<uuid>';
+-- 1. Set wg_config NULL (client refuse to connect)
+UPDATE user_data SET wg_config = NULL WHERE id = '<user-uuid>';
 ```
 
 ```bash
 # 2. Hapus peer di gateway (drop traffic immediately)
-curl -X DELETE "$SASE_API_URL/peers/<pubkey>" \
-  -H "Authorization: Bearer $SASE_API_KEY"
+ssh gateway "wg set wg0 peer <pubkey> remove"
 ```
 
 ```sql
--- 3. Suspend user di Supabase Auth (cegah re-enroll)
+-- 3. Suspend user di Supabase Auth
 UPDATE auth.users SET banned_until = '2099-12-31' WHERE id = '<uuid>';
 ```
 
-Tunnel user disconnect dalam ~30 detik.
+Tunnel user disconnect dalam ~30 detik (Helper detect handshake stale → faulted → user notified).
 
-### **Bagaimana cara onboard customer baru (multi-tenant)?**
+### **Bagaimana onboard customer baru (multi-tenant)?**
 
-Untuk multi-tenant, tambah `tenant_id` di tabel `sase_peer` dan policy mapping:
+Untuk multi-tenant, tambah `tenant_id` di `user_data`:
 
 ```sql
-ALTER TABLE user_profiles ADD COLUMN tenant_id UUID;
-
-ALTER TABLE sase_peer ADD COLUMN tenant_id UUID;
+ALTER TABLE user_data ADD COLUMN tenant_id UUID;
 ```
 
-Edge Function panggil control plane dengan tag tenant:
-
-```typescript
-await registerPeerAtGateway({
-  ...
-  tags: [role, `tenant:${tenantId}`],
-});
-```
-
-Gateway side: configure routing/firewall per tenant tag.
+Admin tooling provision per-user config dengan gateway/AllowedIPs sesuai tenant. Client tidak perlu tahu — dia hanya read `wg_config` user-nya sendiri.
 
 ## 12.4 Pertanyaan keamanan
 
-### **WireGuard sudah aman by default. Kenapa repot tambah PSK + key rotation?**
+### **WireGuard sudah aman by default. Kenapa tambah PSK?**
 
-Defense in depth.
-
-WireGuard crypto memang strong. Tapi:
-- PSK = mitigasi kalau private key bocor (memory dump, malware)
+Defense in depth:
+- PSK = mitigasi kalau private key bocor
 - PSK = future-proof terhadap quantum attack pada Curve25519
-- Auto rotation = limit window of damage kalau ada compromise
+- PSK = additional symmetric secret yang mudah di-rotate
 
-Cost tambah PSK + rotation: ~50 baris kode di Edge Function. Benefit: significant.
+Cost: ~tambah `PresharedKey = ...` di `[Peer]` section. Benefit: significant.
 
-### **Apakah private key WireGuard bisa di-extract dari Windows DPAPI?**
+### **Apakah private key WG bisa di-extract dari Windows DPAPI?**
 
 Hanya kalau attacker:
-1. Sudah dapat akses sebagai user yang sama (laptop unlocked atau credential bocor)
+1. Sudah dapat akses sebagai user yang sama (laptop unlocked / credential bocor)
 2. Atau punya akses fisik + DPAPI master key
 
-Bukan defense terhadap state actor, tapi cukup untuk mayoritas threat (laptop curi, malware umum).
+Bukan defense terhadap state actor, tapi cukup untuk mayoritas threat.
 
-Untuk paranoid mode, store private key di **TPM / Secure Enclave** — future work, butuh refactor KeyStore.
-
-### **Apakah PSK menggantikan kebutuhan HTTPS?**
-
-Tidak. PSK protect data plane (tunnel UDP). HTTPS protect control plane (request config). Dua-duanya complementary.
+Untuk paranoid mode: store private key di TPM / Secure Enclave — future work, butuh refactor `KeyStore`.
 
 ### **Apakah ada audit log yang bocor PII?**
 
 Tabel `sase_audit_log` log:
-- user_id (UUID, bukan email)
-- device_id (hash)
-- role
-- hostname (potentially identifying)
-- timestamp
+- `user_id` (UUID)
+- `action`
+- `detail` JSONB (bisa include hostname, public_ip)
+- `created_at`
 
-Untuk GDPR compliance, hostname bisa di-hash juga atau di-redact setelah retention period.
+Untuk GDPR compliance, hostname bisa di-hash atau di-redact setelah retention period.
 
-### **Apakah TRMM agent bisa lihat trafik SASE?**
+### **Apakah private key WG di Supabase aman?**
 
-Tidak — TRMM agent jalan di endpoint user, melihat **interface lokal**. Trafik di interface tunnel sudah encrypted di luar process app.
+**Kalau `wg_config` di Supabase include PrivateKey**, itu berarti trust model "admin yang sama yang juga manage user". Acceptable kalau admin = orang yang sama, tapi sub-optimal.
 
-Tapi: TRMM agent **bisa** lihat plaintext trafik di interface non-tunnel kalau pakai script monitoring. Out of scope dokumen ini, tapi tetap relevan untuk threat model.
+**Pattern yang lebih aman**:
+1. Client generate keypair sendiri
+2. Publish hanya pubkey ke `user_data.wg_public_key`
+3. Admin tooling generate config tanpa PrivateKey
+4. Client inject PrivateKey lokal saat apply
+
+Detail di [Bab 5]({{ site.baseurl }}{% link docs/05-config-service.md %}) §5.2.1 dan [Bab 7]({{ site.baseurl }}{% link docs/07-keamanan.md %}) §7.4.
+
+### **Bisakah user lihat wg_config user lain?**
+
+Tidak, kalau RLS aktif:
+
+```sql
+ALTER TABLE user_data ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "users_select_own"
+  ON user_data FOR SELECT USING (auth.uid() = id);
+```
+
+Client query dengan JWT user → PostgREST filter ke row user otomatis.
+
+### **Apakah Helper bisa di-eksploitasi untuk arbitrary command execution?**
+
+Tidak, **kalau implementasi follow whitelist**:
+- Whitelist verb saja (Ping, ApplyConfig, Start, Stop, Status, Install, Uninstall)
+- Validate input regex (tunnel name)
+- Validate config sintaks (must have `[Interface]` + `[Peer]`)
+- No shell-out generic command
+
+Kalau implementator tambah verb "RunCommand" atau pass user input langsung ke shell — itu vulnerability. Code review wajib untuk tiap verb baru.
 
 ### **Bagaimana dengan dual-VPN (user pakai personal VPN + Hermes SASE)?**
 
-WireGuard biasanya jalan baik berlapis dengan VPN lain (mis. corporate over personal NordVPN). Yang harus diwaspadai:
-- MTU stacking → set tunnel Hermes MTU lebih kecil (1280)
-- Routing conflict → Hermes AllowedIPs jangan overlap dengan personal VPN
+Bisa berlapis tapi waspadai:
+- MTU stacking → set Hermes MTU lebih kecil (1280)
+- Routing conflict → AllowedIPs jangan overlap dengan personal VPN
+- Performance degradation karena double encryption
 
 ## 12.5 Roadmap & future work
 
-| Fitur | Estimasi effort | Value |
+| Fitur | Estimasi | Value |
 |---|---|---|
-| WebSocket push policy update (Realtime) | 1 sprint | Medium — hilangkan polling lag |
-| Per-app VPN (split tunnel by process) | 4+ sprint | High — UX better, complex implementasi |
-| TPM / Secure Enclave key storage | 2 sprint | Medium — security improvement |
-| Multi-region gateway selection | 1 sprint | Medium — performance untuk global users |
-| Mobile (iOS/Android) | 4+ sprint | High — but di luar scope desktop |
-| Built-in network throughput analytics | 2 sprint | Low — nice-to-have |
+| Realtime push update via Supabase Realtime | 1 sprint | Medium |
+| Per-app VPN (split by process) | 4+ sprint | High |
+| TPM / Secure Enclave key storage | 2 sprint | Medium |
+| Multi-region gateway selection | 1 sprint | Medium |
+| Mobile (iOS/Android) | 4+ sprint | High (out of scope desktop) |
+| Built-in throughput analytics dashboard | 2 sprint | Low |
+| Ditch ServiceEngine.exe sepenuhnya (setelah TRMM + SASE migrate) | 1 sprint | High (security/maintenance) |
 
-## 12.6 Pertanyaan komparasi
+## 12.6 Komparasi dengan TRMM doc
 
-### **Beda arsitektur ini sama Tailscale apa?**
-
-| Aspek | Tailscale | Refactor SASE Hermes |
+| Aspek | TRMM doc | SASE doc (ini) |
 |---|---|---|
-| Data plane | WireGuard (modified) | WireGuard (vanilla) |
-| Control plane | Tailscale cloud | Self-hosted Edge Function + control plane |
-| Identity | OAuth (Google, GitHub, dll.) | Supabase Auth |
-| Mesh / hub-spoke | Mesh peer-to-peer | Hub-spoke (semua via gateway) |
-| Open source | Server: only Headscale (community) | Full open source |
-| Cost | $5–20/user/bulan | Self-hosted, ~$0.05/user/bulan |
+| Backend | Supabase Edge Function (managed Supabase asumsi) | PostgREST direct (self-hosted) |
+| Privileged op | Tidak butuh helper (TRMM API calls) | Helper Service required |
+| Custom IPC | Dihapus | Diganti typed JSON-RPC ke Helper |
+| Trust boundary | Edge Function pegang TRMM API key | RLS Postgres + Helper local auth |
+| Scope helper | N/A | Verb whitelist khusus WireGuard |
 
-Hermes refactor = essentially "Tailscale-style management dengan vanilla WireGuard data plane, full self-hosted".
-
-### **Beda dengan NetBird?**
-
-NetBird sudah punya semua yang kita build di atas (managed WireGuard, identity-aware, self-hosted). Kalau team ops Hermes mau lighten scope: switch ke NetBird sebagai control plane saja.
-
-Trade-off:
-- NetBird = built-in, tested, less code to maintain
-- Custom = full control, integrasi lebih dalam dengan Supabase + TRMM stack
-
-Saat ini Hermes pilih custom karena sudah investasi di Supabase ecosystem.
+Kedua dokumen pakai pola **3-lapis** yang konsisten supaya tim engineering punya mental model sama untuk seluruh stack refactor.
 
 ---
 

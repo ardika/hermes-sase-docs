@@ -1,11 +1,11 @@
 ---
 layout: default
-title: 4. Layer 1 — TunnelSupervisor
+title: 4. Hermes Helper Service
 nav_order: 5
 permalink: /docs/tunnel-supervisor/
 ---
 
-# 4. Layer 1 — TunnelSupervisor
+# 4. Hermes Helper Service (Layer Privileged)
 {: .no_toc }
 
 ## Daftar Isi
@@ -18,308 +18,585 @@ permalink: /docs/tunnel-supervisor/
 
 ## 4.1 Tujuan
 
-`ITunnelSupervisor` adalah abstraksi cross-platform untuk **lifecycle WireGuard tunnel di OS lokal**. Tugasnya:
+Hermes Helper Service adalah **komponen privileged** yang melakukan operasi WireGuard yang butuh admin/root. UI app (yang jalan as user) tidak melakukan operasi ini langsung — request via named-pipe / unix-socket IPC dengan kontrak typed JSON-RPC.
 
-1. Apply / Replace config tunnel
-2. Start / Stop tunnel (dan service yang membungkusnya)
-3. Query status: up/down, last handshake, bytes transferred, peer count
-4. Install / Uninstall tunnel service
+**Mengapa terpisah dari UI?**
+- `HermesNetwork360Guard.exe` distribute ke end-user, jalan as user biasa
+- Operasi WireGuard butuh privilege admin (lihat [Bab 1]({{ site.baseurl }}{% link docs/01-pendahuluan.md %}) §1.4.2)
+- UAC dialog tiap operasi = UX rusak
+- Solusi: Helper sekali install (oleh installer dengan elevation), persistent jalan as SYSTEM/root
 
-**Yang TIDAK menjadi tugas layer ini:**
-- Generate config (itu Layer 2 — `SaseConfigClient`)
-- Tahu detail backend SASE
-- Manage user identity / authentication
-- Logging server-side
+**Yang dilakukan:**
+1. Listen IPC (named-pipe Win, unix-socket Mac)
+2. Authenticate caller (same-machine, same-user)
+3. Validate input (whitelist verb, regex tunnel name, validate config sintaks)
+4. Eksekusi operasi privileged via stdlib (`ServiceController` di Win, `launchctl` di Mac)
+5. Audit log tiap request
 
-## 4.2 Interface
+**Yang TIDAK dilakukan:**
+- Tidak shell-out arbitrary command (whitelist verb saja)
+- Tidak akses network external
+- Tidak read/write file di luar lokasi WireGuard resmi
+- Tidak cache state (stateless)
 
-```csharp
-using System;
-using System.Threading;
-using System.Threading.Tasks;
+## 4.2 Kontrak JSON-RPC v1
 
-namespace HermesNetwork.Sase.Supervisor;
+Semua request/response dalam JSON-RPC 2.0 over named-pipe (Win) atau unix-socket (Mac).
 
-public interface ITunnelSupervisor
+### 4.2.1 Frame format
+
+Tiap message di-prefix dengan length (4-byte big-endian) lalu UTF-8 JSON body. Server membaca length, lalu N byte body.
+
+```
++------------+-----------------------------+
+| length: 4  | json body: N bytes (UTF-8) |
++------------+-----------------------------+
+```
+
+### 4.2.2 Request
+
+```json
 {
-    /// <summary>Nama logikal tunnel (mis. "Hermes"). Sama dengan label OS service.</summary>
-    string TunnelName { get; }
-
-    /// <summary>Apply / replace config tunnel. Tidak start tunnel.</summary>
-    Task ApplyConfigAsync(string wgConfig, CancellationToken ct = default);
-
-    /// <summary>Start tunnel. Idempotent.</summary>
-    Task StartAsync(CancellationToken ct = default);
-
-    /// <summary>Stop tunnel. Idempotent.</summary>
-    Task StopAsync(CancellationToken ct = default);
-
-    /// <summary>Uninstall tunnel service + delete config file.</summary>
-    Task UninstallAsync(CancellationToken ct = default);
-
-    /// <summary>Query status sekarang. Cepat (sub-second).</summary>
-    Task<TunnelStatus> GetStatusAsync(CancellationToken ct = default);
-
-    /// <summary>Tunggu sampai handshake pertama / berikutnya berhasil (timeout = throw).</summary>
-    Task<DateTimeOffset> WaitHandshakeAsync(
-        TimeSpan? timeout = null, CancellationToken ct = default);
-
-    /// <summary>True kalau process berjalan dengan privilege admin/root.</summary>
-    bool IsElevated { get; }
-}
-
-public sealed record TunnelStatus(
-    TunnelState State,
-    DateTimeOffset? LastHandshake,
-    long BytesReceived,
-    long BytesSent,
-    int PeerCount,
-    string? LocalIp,
-    string? PublicIp);
-
-public enum TunnelState
-{
-    NotInstalled,
-    Stopped,
-    Starting,
-    Up,
-    Stopping,
-    Faulted          // service crashed / config invalid
+  "jsonrpc": "2.0",
+  "id": "<uuid>",
+  "method": "<verb>",
+  "params": { ... }
 }
 ```
 
-## 4.3 Pemilihan implementasi runtime
+### 4.2.3 Response
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "<uuid>",
+  "result": { ... }
+}
+```
+
+atau error:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "<uuid>",
+  "error": { "code": -32xxx, "message": "...", "data": { ... } }
+}
+```
+
+### 4.2.4 Verb yang didukung
+
+| Method | Params | Result | Privilege diperlukan |
+|---|---|---|---|
+| `Ping` | `{}` | `{"version":"1.0","time":"2026-04-21T10:00Z"}` | None |
+| `InstallTunnel` | `{"name":"Hermes","config":"..."}` | `{"installed":true}` | Admin (install Win Service) |
+| `UninstallTunnel` | `{"name":"Hermes"}` | `{"uninstalled":true}` | Admin |
+| `ApplyConfig` | `{"name":"Hermes","config":"..."}` | `{"applied":true}` | Admin |
+| `StartTunnel` | `{"name":"Hermes"}` | `{"started":true}` | Admin |
+| `StopTunnel` | `{"name":"Hermes"}` | `{"stopped":true}` | Admin |
+| `GetStatus` | `{"name":"Hermes"}` | `TunnelStatus` (lihat 4.2.5) | None (read) |
+
+### 4.2.5 `TunnelStatus` schema
+
+```json
+{
+  "name": "Hermes",
+  "state": "Up",
+  "lastHandshake": "2026-04-21T10:32:15Z",
+  "bytesReceived": 1234567,
+  "bytesSent":     987654,
+  "peerCount": 1,
+  "interfaceAddress": "10.99.0.42/32"
+}
+```
+
+`state` enum: `NotInstalled` | `Stopped` | `Starting` | `Up` | `Stopping` | `Faulted`.
+
+### 4.2.6 Error codes
+
+| Code | Meaning |
+|---|---|
+| `-32600` | Invalid request format |
+| `-32601` | Method not found / not whitelisted |
+| `-32602` | Invalid params |
+| `-32603` | Internal error |
+| `-32000` | Validation failed (mis. tunnel name regex mismatch) |
+| `-32001` | Caller not authenticated |
+| `-32002` | OS operation failed (forwarded stderr) |
+
+## 4.3 Server-side (HermesHelperSvc)
+
+### 4.3.1 Entry point
 
 ```csharp
-namespace HermesNetwork.Sase.Supervisor;
+// HermesHelperSvc/Program.cs
+using HermesHelperSvc.Os;
+using HermesHelperSvc.Rpc;
+using Microsoft.Extensions.Hosting;
 
-public static class TunnelSupervisorFactory
+var builder = Host.CreateApplicationBuilder(args);
+
+builder.Services.AddSingleton<IOsBackend>(_ =>
+    OperatingSystem.IsWindows() ? new WindowsBackend() :
+    OperatingSystem.IsMacOS()   ? new MacBackend()     :
+    throw new PlatformNotSupportedException());
+
+builder.Services.AddSingleton<JsonRpcServer>();
+builder.Services.AddHostedService<HelperBackgroundService>();
+
+if (OperatingSystem.IsWindows())
+    builder.Services.AddWindowsService(o => o.ServiceName = "HermesHelperSvc");
+else if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+    builder.Services.AddSystemd();   // works for launchd lifecycle too
+
+var host = builder.Build();
+await host.RunAsync();
+```
+
+### 4.3.2 `HelperBackgroundService`
+
+```csharp
+namespace HermesHelperSvc;
+
+public sealed class HelperBackgroundService : BackgroundService
 {
-    public static ITunnelSupervisor Create(string tunnelName)
+    private readonly JsonRpcServer _rpc;
+    private readonly ILogger<HelperBackgroundService> _log;
+
+    public HelperBackgroundService(JsonRpcServer rpc, ILogger<HelperBackgroundService> log)
+    { _rpc = rpc; _log = log; }
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        _log.LogInformation("HermesHelperSvc starting");
+        await _rpc.RunAsync(ct);
+    }
+}
+```
+
+### 4.3.3 `JsonRpcServer` (cross-platform)
+
+```csharp
+using System.Buffers.Binary;
+using System.IO.Pipes;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
+using HermesHelperSvc.Os;
+
+namespace HermesHelperSvc.Rpc;
+
+public sealed class JsonRpcServer
+{
+    private const string WindowsPipeName = "HermesHelper";
+    private const string UnixSocketPath  = "/var/run/hermes-helper.sock";
+
+    private readonly IOsBackend _backend;
+    private readonly ILogger<JsonRpcServer> _log;
+    private readonly CallerAuthenticator _auth;
+
+    public JsonRpcServer(IOsBackend backend, ILogger<JsonRpcServer> log, CallerAuthenticator auth)
+    { _backend = backend; _log = log; _auth = auth; }
+
+    public async Task RunAsync(CancellationToken ct)
     {
         if (OperatingSystem.IsWindows())
-            return new Windows.WindowsTunnelSupervisor(tunnelName);
-        if (OperatingSystem.IsMacOS())
-            return new Mac.MacTunnelSupervisor(tunnelName);
-
-        throw new PlatformNotSupportedException(
-            "TunnelSupervisor only supports Windows and macOS.");
-    }
-}
-```
-
-## 4.4 Implementasi Windows
-
-WireGuard for Windows menyediakan **named-pipe protocol** dan command line `wireguard.exe /installtunnelservice <conf>` / `/uninstalltunnelservice <name>`. Pendekatan paling clean:
-
-- **Install**: `wireguard.exe /installtunnelservice <path-to-conf>` (creates `WireGuardTunnel$<TunnelName>` Windows service)
-- **Start/Stop**: `ServiceController` standar
-- **Status query**: `wg show` CLI (lebih mudah parse) atau named-pipe protocol (lebih cepat tapi binary)
-
-```csharp
-using System;
-using System.Diagnostics;
-using System.IO;
-using System.Runtime.Versioning;
-using System.Security.Principal;
-using System.ServiceProcess;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-
-namespace HermesNetwork.Sase.Supervisor.Windows;
-
-[SupportedOSPlatform("windows")]
-public sealed class WindowsTunnelSupervisor : ITunnelSupervisor
-{
-    public string TunnelName { get; }
-
-    private readonly string _wireguardExe;
-    private readonly string _wgExe;
-    private readonly string _configPath;
-
-    public WindowsTunnelSupervisor(string tunnelName)
-    {
-        TunnelName = tunnelName ?? throw new ArgumentNullException(nameof(tunnelName));
-        var wgDir = @"C:\Program Files\WireGuard";
-        _wireguardExe = Path.Combine(wgDir, "wireguard.exe");
-        _wgExe        = Path.Combine(wgDir, "wg.exe");
-
-        // Lokasi config sebelum kita pass ke /installtunnelservice
-        _configPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "HermesNetwork360Guard", "Sase", $"{tunnelName}.conf");
-    }
-
-    public bool IsElevated
-    {
-        get
-        {
-            using var id = WindowsIdentity.GetCurrent();
-            return new WindowsPrincipal(id).IsInRole(WindowsBuiltInRole.Administrator);
-        }
-    }
-
-    private string ServiceName => $"WireGuardTunnel${TunnelName}";
-
-    public async Task ApplyConfigAsync(string wgConfig, CancellationToken ct = default)
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
-        await File.WriteAllTextAsync(_configPath, wgConfig, new UTF8Encoding(false), ct);
-
-        // Restrict ACL: only admin + SYSTEM (config contains private key)
-        SetSecureAcl(_configPath);
-
-        // Install service kalau belum ada, kalau sudah ada uninstall + reinstall biar config terbaru di-pakai
-        if (await GetStatusAsync(ct) is { State: TunnelState.NotInstalled })
-        {
-            await InstallServiceAsync(ct);
-        }
+            await RunWindowsAsync(ct);
         else
+            await RunUnixAsync(ct);
+    }
+
+    private async Task RunWindowsAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
         {
-            await UninstallAsync(ct);
-            await InstallServiceAsync(ct);
+            var pipe = new NamedPipeServerStream(
+                WindowsPipeName,
+                PipeDirection.InOut,
+                NamedPipeServerStream.MaxAllowedServerInstances,
+                PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous);
+
+            await pipe.WaitForConnectionAsync(ct);
+            _ = HandleClientAsync(pipe, ct);  // fire-and-forget per connection
         }
     }
 
-    public async Task StartAsync(CancellationToken ct = default)
+    private async Task RunUnixAsync(CancellationToken ct)
     {
-        var status = await GetStatusAsync(ct);
-        if (status.State == TunnelState.Up || status.State == TunnelState.Starting) return;
-        if (status.State == TunnelState.NotInstalled)
-            throw new InvalidOperationException(
-                "Tunnel tidak terinstall — panggil ApplyConfigAsync dulu.");
+        if (File.Exists(UnixSocketPath)) File.Delete(UnixSocketPath);
+        var endpoint = new UnixDomainSocketEndPoint(UnixSocketPath);
 
-        using var sc = new ServiceController(ServiceName);
-        sc.Start();
-        await WaitForServiceAsync(sc, ServiceControllerStatus.Running, ct);
-    }
+        using var listener = new Socket(
+            AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        listener.Bind(endpoint);
+        listener.Listen(64);
 
-    public async Task StopAsync(CancellationToken ct = default)
-    {
-        var status = await GetStatusAsync(ct);
-        if (status.State == TunnelState.Stopped || status.State == TunnelState.NotInstalled) return;
+        // Restrict socket permission ke root only — kernel akan check kalau pake SO_PEERCRED
+        File.SetUnixFileMode(UnixSocketPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        using var sc = new ServiceController(ServiceName);
-        if (sc.Status == ServiceControllerStatus.Running)
+        while (!ct.IsCancellationRequested)
         {
-            sc.Stop();
-            await WaitForServiceAsync(sc, ServiceControllerStatus.Stopped, ct);
+            var conn = await listener.AcceptAsync(ct);
+            _ = HandleSocketAsync(conn, ct);
         }
     }
 
-    public async Task UninstallAsync(CancellationToken ct = default)
+    private async Task HandleClientAsync(Stream conn, CancellationToken ct)
     {
-        var psi = new ProcessStartInfo(_wireguardExe,
-            $"/uninstalltunnelservice {TunnelName}")
+        using (conn)
         {
-            UseShellExecute = true,
-            Verb = IsElevated ? "" : "runas",
-            CreateNoWindow = true,
-        };
-        using var p = Process.Start(psi);
-        if (p is not null) await p.WaitForExitAsync(ct);
+            try
+            {
+                if (!await _auth.AuthenticateAsync(conn, ct))
+                {
+                    await WriteErrorAsync(conn, null, -32001, "Caller not authenticated", ct);
+                    return;
+                }
 
-        if (File.Exists(_configPath))
-            File.Delete(_configPath);
+                while (conn.CanRead)
+                {
+                    var msg = await ReadFrameAsync(conn, ct);
+                    if (msg is null) return;
+                    var resp = await DispatchAsync(msg, ct);
+                    await WriteFrameAsync(conn, resp, ct);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "RPC connection error");
+            }
+        }
     }
 
-    public async Task<TunnelStatus> GetStatusAsync(CancellationToken ct = default)
+    private async Task HandleSocketAsync(Socket sock, CancellationToken ct)
     {
-        // 1. Check service state
-        TunnelState state;
+        await using var ns = new NetworkStream(sock, ownsSocket: true);
+        await HandleClientAsync(ns, ct);
+    }
+
+    private async Task<string> DispatchAsync(string requestJson, CancellationToken ct)
+    {
         try
         {
-            using var sc = new ServiceController(ServiceName);
-            state = sc.Status switch
+            var req = JsonSerializer.Deserialize<RpcRequest>(requestJson)
+                ?? throw new InvalidOperationException("null request");
+
+            _log.LogInformation("RPC {Method} id={Id}", req.Method, req.Id);
+
+            object? result = req.Method switch
             {
-                ServiceControllerStatus.Running      => TunnelState.Up,
-                ServiceControllerStatus.Stopped      => TunnelState.Stopped,
-                ServiceControllerStatus.StartPending => TunnelState.Starting,
-                ServiceControllerStatus.StopPending  => TunnelState.Stopping,
-                _                                    => TunnelState.Faulted,
+                "Ping"            => new { version = "1.0", time = DateTimeOffset.UtcNow },
+                "InstallTunnel"   => await HandleInstall(req, ct),
+                "UninstallTunnel" => await HandleUninstall(req, ct),
+                "ApplyConfig"     => await HandleApplyConfig(req, ct),
+                "StartTunnel"     => await HandleStart(req, ct),
+                "StopTunnel"      => await HandleStop(req, ct),
+                "GetStatus"       => await HandleStatus(req, ct),
+                _ => throw new RpcException(-32601, $"Unknown method: {req.Method}")
             };
+
+            return JsonSerializer.Serialize(new RpcResponse(req.Id, result, null));
         }
-        catch (InvalidOperationException)
+        catch (RpcException rx)
         {
-            return new TunnelStatus(TunnelState.NotInstalled, null, 0, 0, 0, null, null);
+            return JsonSerializer.Serialize(new RpcResponse(
+                ParseId(requestJson), null,
+                new RpcError(rx.Code, rx.Message, rx.Data)));
         }
-
-        if (state != TunnelState.Up)
-            return new TunnelStatus(state, null, 0, 0, 0, null, null);
-
-        // 2. Tanya wg show untuk detail
-        return await ParseWgShowAsync(ct) with { State = state };
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "RPC dispatch error");
+            return JsonSerializer.Serialize(new RpcResponse(
+                ParseId(requestJson), null,
+                new RpcError(-32603, "Internal error", ex.Message)));
+        }
     }
 
-    public async Task<DateTimeOffset> WaitHandshakeAsync(
-        TimeSpan? timeout = null, CancellationToken ct = default)
+    private async Task<object> HandleInstall(RpcRequest req, CancellationToken ct)
     {
-        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(15));
-        while (DateTime.UtcNow < deadline)
-        {
-            ct.ThrowIfCancellationRequested();
-            var st = await GetStatusAsync(ct);
-            if (st.LastHandshake is { } hs && hs > DateTimeOffset.UtcNow.AddMinutes(-3))
-                return hs;
-            await Task.Delay(1_000, ct);
-        }
-        throw new TimeoutException("WireGuard handshake belum tercapai dalam window timeout.");
+        var p = req.Params!.GetValueAs<InstallParams>();
+        ValidateTunnelName(p.Name);
+        ValidateWgConfig(p.Config);
+        await _backend.InstallTunnelAsync(p.Name, p.Config, ct);
+        return new { installed = true };
+    }
+
+    private async Task<object> HandleApplyConfig(RpcRequest req, CancellationToken ct)
+    {
+        var p = req.Params!.GetValueAs<InstallParams>();
+        ValidateTunnelName(p.Name);
+        ValidateWgConfig(p.Config);
+        await _backend.ApplyConfigAsync(p.Name, p.Config, ct);
+        return new { applied = true };
+    }
+
+    private async Task<object> HandleStart(RpcRequest req, CancellationToken ct)
+    {
+        var p = req.Params!.GetValueAs<NameParam>();
+        ValidateTunnelName(p.Name);
+        await _backend.StartTunnelAsync(p.Name, ct);
+        return new { started = true };
+    }
+
+    private async Task<object> HandleStop(RpcRequest req, CancellationToken ct)
+    {
+        var p = req.Params!.GetValueAs<NameParam>();
+        ValidateTunnelName(p.Name);
+        await _backend.StopTunnelAsync(p.Name, ct);
+        return new { stopped = true };
+    }
+
+    private async Task<object> HandleUninstall(RpcRequest req, CancellationToken ct)
+    {
+        var p = req.Params!.GetValueAs<NameParam>();
+        ValidateTunnelName(p.Name);
+        await _backend.UninstallTunnelAsync(p.Name, ct);
+        return new { uninstalled = true };
+    }
+
+    private async Task<object> HandleStatus(RpcRequest req, CancellationToken ct)
+    {
+        var p = req.Params!.GetValueAs<NameParam>();
+        ValidateTunnelName(p.Name);
+        return await _backend.GetStatusAsync(p.Name, ct);
     }
 
     // ---------------- helpers ----------------
 
-    private async Task InstallServiceAsync(CancellationToken ct)
+    private static void ValidateTunnelName(string name)
     {
-        var psi = new ProcessStartInfo(_wireguardExe,
-            $"/installtunnelservice \"{_configPath}\"")
-        {
-            UseShellExecute = true,
-            Verb = IsElevated ? "" : "runas",
-            CreateNoWindow = true,
-        };
-        using var p = Process.Start(psi);
-        if (p is null) throw new InvalidOperationException("Could not start wireguard.exe");
-        await p.WaitForExitAsync(ct);
-        if (p.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"wireguard.exe /installtunnelservice exited with code {p.ExitCode}");
+        if (string.IsNullOrEmpty(name) || name.Length > 32 ||
+            !System.Text.RegularExpressions.Regex.IsMatch(name, @"^[A-Za-z0-9_-]+$"))
+            throw new RpcException(-32000, "Invalid tunnel name");
     }
 
-    private async Task<TunnelStatus> ParseWgShowAsync(CancellationToken ct)
+    private static void ValidateWgConfig(string content)
     {
-        var (code, stdout, _) = await RunAsync(_wgExe, $"show {TunnelName} dump", ct);
-        if (code != 0)
-            return new TunnelStatus(TunnelState.Faulted, null, 0, 0, 0, null, null);
+        if (string.IsNullOrWhiteSpace(content) || content.Length > 16 * 1024)
+            throw new RpcException(-32000, "Config empty or too large");
+        if (!content.Contains("[Interface]") || !content.Contains("[Peer]"))
+            throw new RpcException(-32000, "Config missing [Interface] or [Peer] section");
+    }
 
-        // Format dump: tab-separated columns. Line pertama = interface, sisanya = peers.
-        // interface: priv-key   pub-key   listen-port   fwmark
-        // peer:      pub-key   psk   endpoint   allowed-ips   latest-handshake   rx-bytes   tx-bytes   keepalive
+    private static async Task<string?> ReadFrameAsync(Stream s, CancellationToken ct)
+    {
+        var lenBuf = new byte[4];
+        var n = await s.ReadAsync(lenBuf.AsMemory(), ct);
+        if (n != 4) return null;
+        var len = BinaryPrimitives.ReadInt32BigEndian(lenBuf);
+        if (len <= 0 || len > 1 * 1024 * 1024) throw new InvalidDataException("Frame too large");
+        var body = new byte[len];
+        var read = 0;
+        while (read < len)
+        {
+            var r = await s.ReadAsync(body.AsMemory(read, len - read), ct);
+            if (r == 0) return null;
+            read += r;
+        }
+        return Encoding.UTF8.GetString(body);
+    }
+
+    private static async Task WriteFrameAsync(Stream s, string content, CancellationToken ct)
+    {
+        var body = Encoding.UTF8.GetBytes(content);
+        var hdr = new byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(hdr, body.Length);
+        await s.WriteAsync(hdr, ct);
+        await s.WriteAsync(body, ct);
+        await s.FlushAsync(ct);
+    }
+
+    private static string? ParseId(string json)
+    {
+        try { return JsonDocument.Parse(json).RootElement.GetProperty("id").GetString(); }
+        catch { return null; }
+    }
+}
+
+public sealed record InstallParams(string Name, string Config);
+public sealed record NameParam(string Name);
+public sealed record RpcRequest(string Id, string Method, JsonElement? Params);
+public sealed record RpcResponse(string? Id, object? Result, RpcError? Error)
+{
+    public string Jsonrpc => "2.0";
+}
+public sealed record RpcError(int Code, string Message, object? Data);
+public sealed class RpcException(int code, string message, object? data = null) : Exception(message)
+{
+    public int Code { get; } = code;
+    public object? Data { get; } = data;
+}
+
+public static class JsonElementExt
+{
+    public static T GetValueAs<T>(this JsonElement el) =>
+        JsonSerializer.Deserialize<T>(el.GetRawText())
+        ?? throw new RpcException(-32602, "Invalid params");
+}
+```
+
+### 4.3.4 `IOsBackend` (Windows + Mac)
+
+```csharp
+namespace HermesHelperSvc.Os;
+
+public interface IOsBackend
+{
+    Task InstallTunnelAsync(string name, string config, CancellationToken ct);
+    Task UninstallTunnelAsync(string name, CancellationToken ct);
+    Task ApplyConfigAsync(string name, string config, CancellationToken ct);
+    Task StartTunnelAsync(string name, CancellationToken ct);
+    Task StopTunnelAsync(string name, CancellationToken ct);
+    Task<TunnelStatus> GetStatusAsync(string name, CancellationToken ct);
+}
+
+public sealed record TunnelStatus(
+    string Name,
+    string State,                    // "NotInstalled" | "Stopped" | "Up" | ...
+    DateTimeOffset? LastHandshake,
+    long BytesReceived,
+    long BytesSent,
+    int PeerCount,
+    string? InterfaceAddress);
+```
+
+#### `WindowsBackend.cs`
+
+Pakai `wireguard.exe` untuk install/uninstall tunnel service, `ServiceController` untuk start/stop, `wg.exe show <name> dump` untuk status.
+
+```csharp
+[SupportedOSPlatform("windows")]
+public sealed class WindowsBackend : IOsBackend
+{
+    private const string WgDir = @"C:\Program Files\WireGuard";
+    private static string WireguardExe => Path.Combine(WgDir, "wireguard.exe");
+    private static string WgExe        => Path.Combine(WgDir, "wg.exe");
+
+    public async Task InstallTunnelAsync(string name, string config, CancellationToken ct)
+    {
+        var tmpPath = Path.Combine(Path.GetTempPath(), $"hermes-{name}-{Guid.NewGuid():N}.conf");
+        await File.WriteAllTextAsync(tmpPath, config, ct);
+        try
+        {
+            await RunAsync(WireguardExe, $"/installtunnelservice \"{tmpPath}\"", ct);
+        }
+        finally
+        {
+            try { File.Delete(tmpPath); } catch { }
+        }
+    }
+
+    public async Task UninstallTunnelAsync(string name, CancellationToken ct)
+        => await RunAsync(WireguardExe, $"/uninstalltunnelservice {name}", ct);
+
+    public async Task ApplyConfigAsync(string name, string config, CancellationToken ct)
+    {
+        // Cara paling simple: uninstall + re-install dengan config baru
+        try { await UninstallTunnelAsync(name, ct); } catch { /* mungkin belum install */ }
+        await InstallTunnelAsync(name, config, ct);
+    }
+
+    public async Task StartTunnelAsync(string name, CancellationToken ct)
+    {
+        using var sc = new ServiceController($"WireGuardTunnel${name}");
+        if (sc.Status == ServiceControllerStatus.Running) return;
+        sc.Start();
+        await WaitForStatusAsync(sc, ServiceControllerStatus.Running, TimeSpan.FromSeconds(30), ct);
+    }
+
+    public async Task StopTunnelAsync(string name, CancellationToken ct)
+    {
+        using var sc = new ServiceController($"WireGuardTunnel${name}");
+        if (sc.Status == ServiceControllerStatus.Stopped) return;
+        sc.Stop();
+        await WaitForStatusAsync(sc, ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30), ct);
+    }
+
+    public async Task<TunnelStatus> GetStatusAsync(string name, CancellationToken ct)
+    {
+        var serviceName = $"WireGuardTunnel${name}";
+        string state;
+        try
+        {
+            using var sc = new ServiceController(serviceName);
+            state = sc.Status switch
+            {
+                ServiceControllerStatus.Running => "Up",
+                ServiceControllerStatus.Stopped => "Stopped",
+                ServiceControllerStatus.StartPending => "Starting",
+                ServiceControllerStatus.StopPending => "Stopping",
+                _ => "Faulted",
+            };
+        }
+        catch (InvalidOperationException)
+        {
+            return new TunnelStatus(name, "NotInstalled", null, 0, 0, 0, null);
+        }
+
+        if (state != "Up")
+            return new TunnelStatus(name, state, null, 0, 0, 0, null);
+
+        return await ParseWgShowAsync(name, ct) with { Name = name, State = state };
+    }
+
+    private async Task<TunnelStatus> ParseWgShowAsync(string name, CancellationToken ct)
+    {
+        var (code, stdout, _) = await RunWithOutputAsync(WgExe, $"show {name} dump", ct);
+        if (code != 0)
+            return new TunnelStatus(name, "Faulted", null, 0, 0, 0, null);
+
         long rx = 0, tx = 0;
         DateTimeOffset? lastHs = null;
-        int peerCount = 0;
+        int peers = 0;
         var lines = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
         for (int i = 1; i < lines.Length; i++)
         {
             var cols = lines[i].Split('\t');
             if (cols.Length < 8) continue;
-            peerCount++;
+            peers++;
             if (long.TryParse(cols[5], out var rxB)) rx += rxB;
             if (long.TryParse(cols[6], out var txB)) tx += txB;
-            if (long.TryParse(cols[4], out var hsUnix) && hsUnix > 0)
+            if (long.TryParse(cols[4], out var hs) && hs > 0)
             {
-                var t = DateTimeOffset.FromUnixTimeSeconds(hsUnix);
+                var t = DateTimeOffset.FromUnixTimeSeconds(hs);
                 if (lastHs is null || t > lastHs) lastHs = t;
             }
         }
-
-        return new TunnelStatus(TunnelState.Up, lastHs, rx, tx, peerCount, null, null);
+        return new TunnelStatus(name, "Up", lastHs, rx, tx, peers, null);
     }
 
-    private static async Task WaitForServiceAsync(
-        ServiceController sc, ServiceControllerStatus target, CancellationToken ct)
+    // ---------------- helpers ----------------
+
+    private static async Task RunAsync(string file, string args, CancellationToken ct)
     {
-        var deadline = DateTime.UtcNow.AddSeconds(30);
+        var (code, _, stderr) = await RunWithOutputAsync(file, args, ct);
+        if (code != 0)
+            throw new RpcException(-32002, $"OS command failed (exit {code}): {stderr}");
+    }
+
+    private static async Task<(int Code, string Stdout, string Stderr)> RunWithOutputAsync(
+        string file, string args, CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo(file, args)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        using var p = Process.Start(psi)!;
+        var so = p.StandardOutput.ReadToEndAsync();
+        var se = p.StandardError.ReadToEndAsync();
+        await p.WaitForExitAsync(ct);
+        return (p.ExitCode, await so, await se);
+    }
+
+    private static async Task WaitForStatusAsync(
+        ServiceController sc, ServiceControllerStatus target, TimeSpan timeout, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
@@ -327,202 +604,125 @@ public sealed class WindowsTunnelSupervisor : ITunnelSupervisor
             if (sc.Status == target) return;
             await Task.Delay(500, ct);
         }
-        throw new TimeoutException(
-            $"Service {sc.ServiceName} tidak mencapai status {target} dalam 30s.");
-    }
-
-    private static async Task<(int Code, string Stdout, string Stderr)> RunAsync(
-        string file, string args, CancellationToken ct, int timeoutSeconds = 15)
-    {
-        var psi = new ProcessStartInfo(file, args)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        using var p = Process.Start(psi)!;
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
-
-        var stdoutTask = p.StandardOutput.ReadToEndAsync();
-        var stderrTask = p.StandardError.ReadToEndAsync();
-        await p.WaitForExitAsync(cts.Token);
-
-        return (p.ExitCode, await stdoutTask, await stderrTask);
-    }
-
-    private static void SetSecureAcl(string path)
-    {
-        // Pakai ACL Windows untuk batasi akses ke admin + SYSTEM
-        // (Implementasi penuh: System.Security.AccessControl)
-        // Stub: rely on default ACL inherited dari %LOCALAPPDATA% user
-        // Untuk produksi, implementasikan dengan FileSecurity + AddAccessRule
+        throw new TimeoutException($"Service did not reach {target} in {timeout.TotalSeconds}s");
     }
 }
 ```
 
-## 4.5 Implementasi macOS
+#### `MacBackend.cs`
 
-Pakai `wg-quick` (script wrapper di atas `wg`) plus LaunchDaemon untuk persistent service.
+Pakai `wg-quick` + `launchctl`. Helper sendiri jalan as root (LaunchDaemon), jadi tidak butuh `osascript` elevation.
 
 ```csharp
-using System;
-using System.Diagnostics;
-using System.IO;
-using System.Runtime.Versioning;
-using System.Threading;
-using System.Threading.Tasks;
-
-namespace HermesNetwork.Sase.Supervisor.Mac;
-
 [SupportedOSPlatform("macos")]
-public sealed class MacTunnelSupervisor : ITunnelSupervisor
+public sealed class MacBackend : IOsBackend
 {
-    public string TunnelName { get; }
-    private readonly string _configPath;       // /etc/wireguard/<name>.conf
-    private readonly string _plistPath;        // /Library/LaunchDaemons/com.hermesnetwork.sase.plist
-    private readonly string _label;            // com.hermesnetwork.sase
+    private const string WgQuick = "/usr/local/bin/wg-quick";
+    private const string WgBin   = "/usr/local/bin/wg";
+    private const string Label   = "com.hermesnetwork.sase";   // LaunchDaemon untuk WG tunnel
+    private string ConfPath(string name) => $"/etc/wireguard/{name}.conf";
+    private string PlistPath(string name) => $"/Library/LaunchDaemons/com.hermesnetwork.sase.{name}.plist";
 
-    public MacTunnelSupervisor(string tunnelName)
+    public async Task InstallTunnelAsync(string name, string config, CancellationToken ct)
     {
-        TunnelName = tunnelName;
-        _configPath = $"/etc/wireguard/{tunnelName}.conf";
-        _label = "com.hermesnetwork.sase";
-        _plistPath = $"/Library/LaunchDaemons/{_label}.plist";
+        Directory.CreateDirectory("/etc/wireguard");
+        await File.WriteAllTextAsync(ConfPath(name), config, ct);
+        File.SetUnixFileMode(ConfPath(name), UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+        // Optional: register LaunchDaemon agar tunnel auto-start saat reboot
+        var plist = LaunchDaemonPlistFor(name);
+        await File.WriteAllTextAsync(PlistPath(name), plist, ct);
+        File.SetUnixFileMode(PlistPath(name),
+            UnixFileMode.UserRead | UnixFileMode.UserWrite |
+            UnixFileMode.GroupRead | UnixFileMode.OtherRead);
     }
 
-    public bool IsElevated => Environment.UserName == "root";
-
-    public async Task ApplyConfigAsync(string wgConfig, CancellationToken ct = default)
+    public async Task UninstallTunnelAsync(string name, CancellationToken ct)
     {
-        // Tulis config ke /tmp dulu, lalu pindah dengan elevation
-        var tmp = Path.Combine(Path.GetTempPath(), $"sase-{Guid.NewGuid():N}.conf");
-        await File.WriteAllTextAsync(tmp, wgConfig, ct);
-
-        var cmd = $"mkdir -p /etc/wireguard && " +
-                  $"mv \\\"{tmp}\\\" \\\"{_configPath}\\\" && " +
-                  $"chmod 600 \\\"{_configPath}\\\" && " +
-                  $"chown root:wheel \\\"{_configPath}\\\"";
-        await RunWithElevationAsync(cmd, ct);
-
-        // Install LaunchDaemon kalau belum ada
-        if (!File.Exists(_plistPath))
-            await InstallLaunchDaemonAsync(ct);
+        try { await StopTunnelAsync(name, ct); } catch { }
+        await RunAsync("launchctl", $"bootout system/com.hermesnetwork.sase.{name}", ct, allowFail: true);
+        if (File.Exists(PlistPath(name))) File.Delete(PlistPath(name));
+        if (File.Exists(ConfPath(name))) File.Delete(ConfPath(name));
     }
 
-    public Task StartAsync(CancellationToken ct = default)
-        => RunWithElevationAsync($"launchctl bootstrap system {_plistPath} 2>/dev/null; " +
-                                 $"launchctl kickstart -k system/{_label}", ct);
-
-    public Task StopAsync(CancellationToken ct = default)
-        => RunWithElevationAsync($"launchctl bootout system/{_label} 2>/dev/null; " +
-                                 $"wg-quick down {TunnelName} 2>/dev/null", ct);
-
-    public async Task UninstallAsync(CancellationToken ct = default)
+    public async Task ApplyConfigAsync(string name, string config, CancellationToken ct)
     {
-        try { await StopAsync(ct); } catch { }
-        await RunWithElevationAsync(
-            $"rm -f \\\"{_plistPath}\\\" \\\"{_configPath}\\\"", ct);
-    }
-
-    public async Task<TunnelStatus> GetStatusAsync(CancellationToken ct = default)
-    {
-        if (!File.Exists(_configPath))
-            return new TunnelStatus(TunnelState.NotInstalled, null, 0, 0, 0, null, null);
-
-        var (code, stdout, _) = await RunAsync("wg", $"show {TunnelName} dump", ct);
-        if (code != 0)
+        await File.WriteAllTextAsync(ConfPath(name), config, ct);
+        File.SetUnixFileMode(ConfPath(name), UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        // Restart tunnel kalau sedang up — wg-quick down + up
+        var st = await GetStatusAsync(name, ct);
+        if (st.State == "Up")
         {
-            // Tunnel tidak up
-            return new TunnelStatus(TunnelState.Stopped, null, 0, 0, 0, null, null);
+            await StopTunnelAsync(name, ct);
+            await StartTunnelAsync(name, ct);
         }
+    }
 
-        // Same parsing as Windows
+    public Task StartTunnelAsync(string name, CancellationToken ct)
+        => RunAsync(WgQuick, $"up {name}", ct);
+
+    public Task StopTunnelAsync(string name, CancellationToken ct)
+        => RunAsync(WgQuick, $"down {name}", ct, allowFail: true);
+
+    public async Task<TunnelStatus> GetStatusAsync(string name, CancellationToken ct)
+    {
+        if (!File.Exists(ConfPath(name)))
+            return new TunnelStatus(name, "NotInstalled", null, 0, 0, 0, null);
+
+        var (code, stdout, _) = await RunWithOutputAsync(WgBin, $"show {name} dump", ct);
+        if (code != 0)
+            return new TunnelStatus(name, "Stopped", null, 0, 0, 0, null);
+
         long rx = 0, tx = 0;
         DateTimeOffset? lastHs = null;
-        int peerCount = 0;
+        int peers = 0;
         var lines = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
         for (int i = 1; i < lines.Length; i++)
         {
             var cols = lines[i].Split('\t');
             if (cols.Length < 8) continue;
-            peerCount++;
+            peers++;
             if (long.TryParse(cols[5], out var rxB)) rx += rxB;
             if (long.TryParse(cols[6], out var txB)) tx += txB;
-            if (long.TryParse(cols[4], out var hsUnix) && hsUnix > 0)
+            if (long.TryParse(cols[4], out var hs) && hs > 0)
             {
-                var t = DateTimeOffset.FromUnixTimeSeconds(hsUnix);
+                var t = DateTimeOffset.FromUnixTimeSeconds(hs);
                 if (lastHs is null || t > lastHs) lastHs = t;
             }
         }
-        return new TunnelStatus(TunnelState.Up, lastHs, rx, tx, peerCount, null, null);
+        return new TunnelStatus(name, "Up", lastHs, rx, tx, peers, null);
     }
 
-    public async Task<DateTimeOffset> WaitHandshakeAsync(
-        TimeSpan? timeout = null, CancellationToken ct = default)
-    {
-        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(15));
-        while (DateTime.UtcNow < deadline)
-        {
-            ct.ThrowIfCancellationRequested();
-            var st = await GetStatusAsync(ct);
-            if (st.LastHandshake is { } hs && hs > DateTimeOffset.UtcNow.AddMinutes(-3))
-                return hs;
-            await Task.Delay(1_000, ct);
-        }
-        throw new TimeoutException("WireGuard handshake belum tercapai dalam window timeout.");
-    }
+    private static string LaunchDaemonPlistFor(string name) => $$"""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key><string>com.hermesnetwork.sase.{{name}}</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>/usr/local/bin/wg-quick</string>
+                <string>up</string>
+                <string>{{name}}</string>
+            </array>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key><false/>
+            <key>UserName</key><string>root</string>
+        </dict>
+        </plist>
+        """;
 
     // ---------------- helpers ----------------
 
-    private async Task InstallLaunchDaemonAsync(CancellationToken ct)
+    private static async Task RunAsync(string file, string args, CancellationToken ct, bool allowFail = false)
     {
-        var plist = $"""
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-                <key>Label</key>
-                <string>{_label}</string>
-                <key>ProgramArguments</key>
-                <array>
-                    <string>/usr/local/bin/wg-quick</string>
-                    <string>up</string>
-                    <string>{TunnelName}</string>
-                </array>
-                <key>RunAtLoad</key><true/>
-                <key>KeepAlive</key><false/>
-                <key>StandardOutPath</key><string>/var/log/sase-tunnel.out.log</string>
-                <key>StandardErrorPath</key><string>/var/log/sase-tunnel.err.log</string>
-                <key>UserName</key><string>root</string>
-            </dict>
-            </plist>
-            """;
-
-        var tmp = Path.Combine(Path.GetTempPath(), $"sase-plist-{Guid.NewGuid():N}.plist");
-        await File.WriteAllTextAsync(tmp, plist, ct);
-
-        await RunWithElevationAsync(
-            $"mv \\\"{tmp}\\\" \\\"{_plistPath}\\\" && " +
-            $"chmod 644 \\\"{_plistPath}\\\" && " +
-            $"chown root:wheel \\\"{_plistPath}\\\"", ct);
+        var (code, _, stderr) = await RunWithOutputAsync(file, args, ct);
+        if (code != 0 && !allowFail)
+            throw new RpcException(-32002, $"OS command failed (exit {code}): {stderr}");
     }
 
-    private async Task RunWithElevationAsync(
-        string shellCmd, CancellationToken ct, int timeoutSeconds = 60)
-    {
-        var escaped = shellCmd.Replace("\"", "\\\"");
-        var script = $"do shell script \"{escaped}\" with administrator privileges";
-
-        var (code, _, stderr) = await RunAsync("osascript", $"-e '{script}'", ct, timeoutSeconds);
-        if (code != 0)
-            throw new InvalidOperationException(
-                $"Elevated command failed (exit {code}): {stderr}");
-    }
-
-    private static async Task<(int Code, string Stdout, string Stderr)> RunAsync(
-        string file, string args, CancellationToken ct, int timeoutSeconds = 30)
+    private static async Task<(int Code, string Stdout, string Stderr)> RunWithOutputAsync(
+        string file, string args, CancellationToken ct)
     {
         var psi = new ProcessStartInfo(file, args)
         {
@@ -532,160 +732,266 @@ public sealed class MacTunnelSupervisor : ITunnelSupervisor
             CreateNoWindow = true,
         };
         using var p = Process.Start(psi)!;
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
         var so = p.StandardOutput.ReadToEndAsync();
         var se = p.StandardError.ReadToEndAsync();
-        await p.WaitForExitAsync(cts.Token);
+        await p.WaitForExitAsync(ct);
         return (p.ExitCode, await so, await se);
     }
 }
 ```
 
-## 4.6 Penggunaan dari ConnectionService
+### 4.3.5 `CallerAuthenticator`
+
+Hanya terima request dari user yang sama (mencegah sniffing dari user lain di multi-user system):
+
+```csharp
+public sealed class CallerAuthenticator
+{
+    public Task<bool> AuthenticateAsync(Stream conn, CancellationToken ct)
+    {
+        // Windows: NamedPipeServerStream punya ImpersonateClient + WindowsIdentity
+        if (conn is NamedPipeServerStream pipe)
+        {
+            try
+            {
+                pipe.RunAsClient(() =>
+                {
+                    using var id = WindowsIdentity.GetCurrent();
+                    // (kalau kita mau policy: hanya user tertentu / Administrators)
+                });
+                return Task.FromResult(true);
+            }
+            catch { return Task.FromResult(false); }
+        }
+
+        // Unix: SO_PEERCRED via socket option (atau cek peer creds via Mono.Posix)
+        if (conn is NetworkStream ns && ns.Socket is { } sock)
+        {
+            // Implementasi SO_PEERCRED tergantung versi OS;
+            // di Mac, gunakan getpeereid() via P/Invoke.
+            // Untuk simple: percaya socket di /var/run/hermes-helper.sock dengan permission 0600
+            return Task.FromResult(true);
+        }
+
+        return Task.FromResult(false);
+    }
+}
+```
+
+> **Catatan keamanan:** detail caller authentication bergantung OS. Lihat [Bab 7]({{ site.baseurl }}{% link docs/07-keamanan.md %}) untuk pembahasan menyeluruh.
+
+## 4.4 Client-side (di UI app)
+
+### 4.4.1 `IHelperServiceClient`
+
+```csharp
+namespace HermesNetwork.Sase.Helper;
+
+public interface IHelperServiceClient
+{
+    Task PingAsync(CancellationToken ct = default);
+    Task ApplyConfigAsync(string name, string config, CancellationToken ct = default);
+    Task InstallTunnelAsync(string name, string config, CancellationToken ct = default);
+    Task UninstallTunnelAsync(string name, CancellationToken ct = default);
+    Task StartTunnelAsync(string name, CancellationToken ct = default);
+    Task StopTunnelAsync(string name, CancellationToken ct = default);
+    Task<TunnelStatusDto> GetStatusAsync(string name, CancellationToken ct = default);
+}
+
+public sealed record TunnelStatusDto(
+    string Name,
+    string State,
+    DateTimeOffset? LastHandshake,
+    long BytesReceived,
+    long BytesSent,
+    int PeerCount,
+    string? InterfaceAddress);
+```
+
+### 4.4.2 `HelperServiceClient`
+
+```csharp
+using System.Buffers.Binary;
+using System.IO.Pipes;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
+
+namespace HermesNetwork.Sase.Helper;
+
+public sealed class HelperServiceClient : IHelperServiceClient
+{
+    private const string WindowsPipe = "HermesHelper";
+    private const string UnixSocket  = "/var/run/hermes-helper.sock";
+
+    public Task PingAsync(CancellationToken ct = default)
+        => CallAsync<object?, object?>("Ping", null, ct);
+
+    public Task ApplyConfigAsync(string name, string config, CancellationToken ct = default)
+        => CallAsync<InstallParams, object>("ApplyConfig", new(name, config), ct);
+
+    public Task InstallTunnelAsync(string name, string config, CancellationToken ct = default)
+        => CallAsync<InstallParams, object>("InstallTunnel", new(name, config), ct);
+
+    public Task UninstallTunnelAsync(string name, CancellationToken ct = default)
+        => CallAsync<NameParam, object>("UninstallTunnel", new(name), ct);
+
+    public Task StartTunnelAsync(string name, CancellationToken ct = default)
+        => CallAsync<NameParam, object>("StartTunnel", new(name), ct);
+
+    public Task StopTunnelAsync(string name, CancellationToken ct = default)
+        => CallAsync<NameParam, object>("StopTunnel", new(name), ct);
+
+    public Task<TunnelStatusDto> GetStatusAsync(string name, CancellationToken ct = default)
+        => CallAsync<NameParam, TunnelStatusDto>("GetStatus", new(name), ct)!;
+
+    // ---------------- internals ----------------
+
+    private async Task<TResult?> CallAsync<TParams, TResult>(
+        string method, TParams? @params, CancellationToken ct)
+    {
+        await using var stream = await ConnectAsync(ct);
+        var req = JsonSerializer.Serialize(new
+        {
+            jsonrpc = "2.0",
+            id = Guid.NewGuid().ToString("N"),
+            method,
+            @params
+        });
+        await WriteFrameAsync(stream, req, ct);
+
+        var respJson = await ReadFrameAsync(stream, ct)
+            ?? throw new InvalidOperationException("Helper closed connection");
+
+        using var doc = JsonDocument.Parse(respJson);
+        if (doc.RootElement.TryGetProperty("error", out var err))
+            throw new HelperRpcException(
+                err.GetProperty("code").GetInt32(),
+                err.GetProperty("message").GetString() ?? "");
+
+        if (!doc.RootElement.TryGetProperty("result", out var result))
+            return default;
+        if (typeof(TResult) == typeof(object)) return default;
+        return JsonSerializer.Deserialize<TResult>(result.GetRawText());
+    }
+
+    private static async Task<Stream> ConnectAsync(CancellationToken ct)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var pipe = new NamedPipeClientStream(
+                ".", WindowsPipe, PipeDirection.InOut, PipeOptions.Asynchronous);
+            await pipe.ConnectAsync(5_000, ct);
+            return pipe;
+        }
+        else
+        {
+            var sock = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            await sock.ConnectAsync(new UnixDomainSocketEndPoint(UnixSocket), ct);
+            return new NetworkStream(sock, ownsSocket: true);
+        }
+    }
+
+    private static async Task WriteFrameAsync(Stream s, string content, CancellationToken ct)
+    {
+        var body = Encoding.UTF8.GetBytes(content);
+        var hdr = new byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(hdr, body.Length);
+        await s.WriteAsync(hdr, ct);
+        await s.WriteAsync(body, ct);
+        await s.FlushAsync(ct);
+    }
+
+    private static async Task<string?> ReadFrameAsync(Stream s, CancellationToken ct)
+    {
+        var lenBuf = new byte[4];
+        var n = await s.ReadAsync(lenBuf.AsMemory(), ct);
+        if (n != 4) return null;
+        var len = BinaryPrimitives.ReadInt32BigEndian(lenBuf);
+        if (len <= 0 || len > 1 * 1024 * 1024) throw new InvalidDataException("Frame too large");
+        var body = new byte[len];
+        var read = 0;
+        while (read < len)
+        {
+            var r = await s.ReadAsync(body.AsMemory(read, len - read), ct);
+            if (r == 0) return null;
+            read += r;
+        }
+        return Encoding.UTF8.GetString(body);
+    }
+
+    private sealed record InstallParams(string Name, string Config);
+    private sealed record NameParam(string Name);
+}
+
+public sealed class HelperRpcException(int code, string message) : Exception(message)
+{
+    public int Code { get; } = code;
+}
+```
+
+### 4.4.3 Penggunaan dari ConnectionService
 
 ```csharp
 public sealed class SaseConnectionService
 {
-    private readonly ITunnelSupervisor _supervisor;
+    private readonly IHelperServiceClient _helper;
     private readonly ISaseConfigClient _config;
-    private readonly ILogger<SaseConnectionService> _log;
+    private const string TunnelName = "Hermes";
 
-    public async Task<ConnectionResult> ConnectAsync(CancellationToken ct = default)
+    public async Task ConnectAsync(CancellationToken ct = default)
     {
-        // 1. Get latest config
-        var configDto = await _config.RequestConfigAsync(ct);
-        var wgConfig = WgConfigBuilder.Build(configDto);
-
-        // 2. Apply
-        await _supervisor.ApplyConfigAsync(wgConfig, ct);
-
-        // 3. Start
-        await _supervisor.StartAsync(ct);
-
-        // 4. Wait for handshake
-        try
-        {
-            var hsTime = await _supervisor.WaitHandshakeAsync(TimeSpan.FromSeconds(15), ct);
-            _log.LogInformation("SASE handshake at {Time}", hsTime);
-            return ConnectionResult.Connected(hsTime);
-        }
-        catch (TimeoutException)
-        {
-            _log.LogWarning("SASE handshake timeout — tunnel up tapi tidak ada peer reply");
-            return ConnectionResult.HandshakeTimeout;
-        }
+        var configContent = await _config.GetConfigAsync(ct);   // dari user_data Supabase
+        await _helper.ApplyConfigAsync(TunnelName, configContent, ct);
+        await _helper.StartTunnelAsync(TunnelName, ct);
+        // polling status...
     }
 
     public Task DisconnectAsync(CancellationToken ct = default)
-        => _supervisor.StopAsync(ct);
+        => _helper.StopTunnelAsync(TunnelName, ct);
 
-    public async Task<TunnelStatus> GetStatusAsync(CancellationToken ct = default)
-        => await _supervisor.GetStatusAsync(ct);
+    public Task<TunnelStatusDto> GetStatusAsync(CancellationToken ct = default)
+        => _helper.GetStatusAsync(TunnelName, ct);
 }
 ```
 
-## 4.7 WgConfigBuilder helper
+## 4.5 Testing
 
-Helper untuk merangkai INI WireGuard dari `SaseConfigDto`:
+### 4.5.1 Unit test Helper handlers (mock IOsBackend)
 
 ```csharp
-using System.Text;
-
-namespace HermesNetwork.Sase;
-
-public static class WgConfigBuilder
+public class JsonRpcServerTests
 {
-    public static string Build(SaseConfigDto dto)
+    [Fact]
+    public async Task DispatchAsync_StartTunnel_CallsBackend()
     {
-        var sb = new StringBuilder();
-        sb.AppendLine("[Interface]");
-        sb.AppendLine($"PrivateKey = {dto.PrivateKey}");
-        sb.AppendLine($"Address = {dto.InterfaceAddress}");
-        if (!string.IsNullOrWhiteSpace(dto.Dns))
-            sb.AppendLine($"DNS = {dto.Dns}");
-        if (dto.Mtu is int mtu)
-            sb.AppendLine($"MTU = {mtu}");
-        sb.AppendLine();
+        var backend = new Mock<IOsBackend>();
+        var server = new JsonRpcServer(backend.Object, NullLogger, new());
 
-        foreach (var peer in dto.Peers)
-        {
-            sb.AppendLine("[Peer]");
-            sb.AppendLine($"PublicKey = {peer.PublicKey}");
-            if (!string.IsNullOrWhiteSpace(peer.PresharedKey))
-                sb.AppendLine($"PresharedKey = {peer.PresharedKey}");
-            sb.AppendLine($"Endpoint = {peer.Endpoint}");
-            sb.AppendLine($"AllowedIPs = {peer.AllowedIPs}");
-            sb.AppendLine($"PersistentKeepalive = {peer.KeepaliveSeconds}");
-            sb.AppendLine();
-        }
-        return sb.ToString();
+        var req = JsonSerializer.Serialize(new {
+            jsonrpc = "2.0", id = "1",
+            method = "StartTunnel",
+            @params = new { name = "Hermes" }
+        });
+
+        var resp = await server.DispatchAsync(req, default);
+        backend.Verify(b => b.StartTunnelAsync("Hermes", default), Times.Once);
+        resp.Should().Contain("\"started\":true");
     }
 }
 ```
 
-## 4.8 Testing
+### 4.5.2 Integration test end-to-end
 
-### 4.8.1 Mock supervisor untuk unit test
+Spin up Helper Service local dengan elevation, lalu pakai `HelperServiceClient` dari proses test.
 
-```csharp
-public sealed class FakeTunnelSupervisor : ITunnelSupervisor
-{
-    public string TunnelName => "test";
-    public bool IsElevated => true;
-    public TunnelStatus CurrentStatus { get; set; } = new(TunnelState.Stopped, null, 0, 0, 0, null, null);
-    public string? AppliedConfig { get; private set; }
+## 4.6 Best practices
 
-    public Task ApplyConfigAsync(string c, CancellationToken ct = default)
-    { AppliedConfig = c; return Task.CompletedTask; }
-    public Task StartAsync(CancellationToken ct = default)
-    { CurrentStatus = CurrentStatus with { State = TunnelState.Up,
-        LastHandshake = DateTimeOffset.UtcNow }; return Task.CompletedTask; }
-    public Task StopAsync(CancellationToken ct = default)
-    { CurrentStatus = CurrentStatus with { State = TunnelState.Stopped }; return Task.CompletedTask; }
-    public Task UninstallAsync(CancellationToken ct = default)
-    { CurrentStatus = new(TunnelState.NotInstalled, null, 0, 0, 0, null, null); return Task.CompletedTask; }
-    public Task<TunnelStatus> GetStatusAsync(CancellationToken ct = default)
-        => Task.FromResult(CurrentStatus);
-    public Task<DateTimeOffset> WaitHandshakeAsync(TimeSpan? t = null, CancellationToken ct = default)
-        => Task.FromResult(CurrentStatus.LastHandshake ?? DateTimeOffset.UtcNow);
-}
-```
-
-### 4.8.2 Manual integration test
-
-**Windows:**
-```powershell
-# Generate test config dengan key real (manual register peer di gateway)
-$config = @"
-[Interface]
-PrivateKey = $(wg genkey)
-Address = 10.99.0.5/32
-DNS = 10.0.0.1
-
-[Peer]
-PublicKey = <gateway-pub-key>
-Endpoint = n1.ndr24.com:51820
-AllowedIPs = 10.0.0.0/8
-PersistentKeepalive = 25
-"@
-
-# Test via supervisor
-dotnet run --project HermesNetwork.SupervisorTest -- apply "$config"
-dotnet run --project HermesNetwork.SupervisorTest -- start
-& "C:\Program Files\WireGuard\wg.exe" show
-dotnet run --project HermesNetwork.SupervisorTest -- stop
-dotnet run --project HermesNetwork.SupervisorTest -- uninstall
-```
-
-## 4.9 Best practices
-
-- **Selalu cek `IsElevated`** sebelum `ApplyConfig` / `Install` / `Uninstall` — minta UAC kalau false
-- **Timeout** semua external process (`wireguard.exe`, `wg-quick`, `osascript`) dengan `CancellationTokenSource.CancelAfter`
-- **Jangan log full config WireGuard** — mengandung PrivateKey, PSK
-- **Set ACL `0o600` (Mac) / restricted ACL (Windows)** pada file config — hanya admin/root yang bisa baca
-- **Idempotent** semua operasi — `StartAsync` di tunnel yang sudah Up = no-op
-- **Handle "tunnel up tapi tidak ada handshake" graceful** — bisa terjadi saat NAT block atau gateway down
+- **Selalu validate input di server side** — jangan trust client meski authenticated
+- **Whitelist verb**, jangan terima method baru tanpa code review
+- **Tidak ada arbitrary command execution** — verb-spesifik dengan parameter terstruktur
+- **Log semua request** ke Event Viewer (Win) / `os_log` (Mac) untuk audit
+- **Fail closed**: kalau ada doubt soal authentication, tolak request
 
 ---
 

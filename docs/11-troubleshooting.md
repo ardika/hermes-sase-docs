@@ -19,313 +19,272 @@ permalink: /docs/troubleshooting/
 ## 11.1 Diagnostic toolkit
 
 ```bash
-# All platforms
+# Lokal (Win / Mac sama)
 wg show
 wg show Hermes latest-handshakes
 wg show Hermes transfer
-ping <internal-IP-yang-harus-jangkau-via-tunnel>
-curl https://ifconfig.me   # IP harus IP gateway, bukan IP user
+ping <internal-IP-yang-ada-di-AllowedIPs>
+curl https://ifconfig.me   # IP harus IP gateway
 
-# Edge function health
-curl -X POST $SB_URL/functions/v1/sase-config \
-  -H "Authorization: Bearer $JWT" \
-  -d '{"device_id":"test","public_key":"<pub>","platform":"windows"}'
+# Helper alive check (named pipe / unix-socket)
+# Kirim Ping JSON-RPC manual via test program
+
+# Supabase query test
+curl "$SUPABASE_URL/rest/v1/user_data?select=wg_config" \
+  -H "apikey: $ANON" -H "Authorization: Bearer $JWT"
 ```
 
 Lokasi log:
 
 | Apa | Windows | macOS |
 |---|---|---|
-| Hermes app log | `%LOCALAPPDATA%\HermesNetwork360Guard\app.log` | `~/Library/Logs/HermesNetwork360Guard/app.log` |
-| WireGuard tunnel log | Event Viewer → Application (source: WireGuard) | `/var/log/sase-tunnel.{out,err}.log` |
-| Edge function log | Supabase Dashboard → Functions → Logs | sama |
+| Hermes UI app | `%LOCALAPPDATA%\HermesNetwork360Guard\app.log` | `~/Library/Logs/HermesNetwork360Guard/app.log` |
+| Hermes Helper | Event Viewer → Application (Source: HermesHelperSvc) | `/var/log/hermes-helper.{out,err}.log` |
+| WireGuard tunnel | Event Viewer → Application (Source: WireGuard) | (none — Helper log) |
 
-## 11.2 "Tunnel tidak handshake"
+## 11.2 Helper Service tidak respond
 
-**Gejala:** `wg show Hermes` menunjukkan peer ada, tapi `latest-handshake` kosong atau "X seconds ago" tidak update.
+**Gejala:** `_helper.PingAsync()` throw timeout atau "pipe not found".
 
-| Penyebab | Cek | Fix |
+| Penyebab | Cara cek | Fix |
 |---|---|---|
-| Firewall block UDP 51820 outbound | `nc -uvz n1.ndr24.com 51820` | Whitelist gateway endpoint di firewall corporate |
-| Public key mismatch (client → gateway) | Compare `wg show` peer pubkey ↔ value di SASE control plane | Refresh config, pastikan edge function pakai `SASE_GATEWAY_PUBLIC_KEY` yang benar |
-| PSK mismatch | (tidak ada cara langsung; check via try without PSK) | Refresh config |
-| Gateway down | curl status page gateway | Hubungi ops |
-| Endpoint IP berubah | Compare config Endpoint vs DNS resolve `n1.ndr24.com` | `wg-quick down && up` (DNS re-resolved) |
-| MTU terlalu besar (packet drop) | `ping -M do -s 1372 <gw>` | Set `MTU = 1280` di config |
-| NAT timeout | Tidak ada keepalive | Set `PersistentKeepalive = 25` |
+| Helper Service belum terinstall | `sc query HermesHelperSvc` (Win) / `launchctl list com.hermesnetwork.helper` (Mac) | Reinstall via installer |
+| Helper Service crash | Event Viewer / `/var/log/hermes-helper.err.log` | Cek error, fix bug, restart |
+| Pipe / socket permission salah | Win: `accesschk -p HermesHelperSvc` / Mac: `ls -la /var/run/hermes-helper.sock` | Restart Helper, pastikan permission setup di startup |
+| UI binary tidak signed | Helper authentication reject | Sign UI binary dengan cert yang sama |
 
 **Diagnosa step-by-step:**
 
-```bash
-# 1. Apakah service running?
+```powershell
 # Windows
-sc query "WireGuardTunnel`$Hermes"
-# macOS
-sudo launchctl list com.hermesnetwork.sase
+sc query HermesHelperSvc
+# Expected: STATE: 4 RUNNING
 
-# 2. Apakah config benar di-loaded?
-# Windows
-type "C:\Program Files\WireGuard\Data\Configurations\Hermes.conf.dpapi.aes"   # binary, butuh decrypt
-# macOS
-sudo cat /etc/wireguard/Hermes.conf
+Get-EventLog -LogName Application -Source HermesHelperSvc -Newest 20
 
-# 3. UDP test
-# All
-nc -uvz n1.ndr24.com 51820
-
-# 4. Tcpdump (Mac/Linux) untuk lihat WireGuard packet
-sudo tcpdump -i any -n udp port 51820 -vv
-
-# 5. Manual reconnect
-sudo wg-quick down Hermes
-sudo wg-quick up Hermes
-sleep 5
-wg show Hermes latest-handshakes
+# Test pipe manual
+$pipe = New-Object IO.Pipes.NamedPipeClientStream(".", "HermesHelper", "InOut")
+$pipe.Connect(2000)   # 2-second timeout
 ```
 
-## 11.3 "Tunnel up, tapi internet tidak jalan"
+```bash
+# macOS
+sudo launchctl list com.hermesnetwork.helper
+# Look for "PID" > 0
 
-**Gejala:** `wg show` menunjukkan handshake fresh, tapi browser/curl tidak jalan.
+sudo tail -50 /var/log/hermes-helper.err.log
+
+# Test socket
+nc -U /var/run/hermes-helper.sock < /dev/null
+```
+
+## 11.3 Tunnel tidak handshake
+
+**Gejala:** `wg show` peer ada, tapi `latest-handshake` kosong / sangat lama.
 
 | Penyebab | Cek | Fix |
 |---|---|---|
-| AllowedIPs tidak cover destination | `wg show Hermes allowed-ips` | Edit policy di edge function role |
-| Routing tidak masuk ke tunnel interface | `route -n get 8.8.8.8` (Mac) | `wg-quick` biasanya handle; restart tunnel |
+| Firewall block UDP 51820 outbound | `nc -uvz <gateway> 51820` | Whitelist gateway endpoint |
+| Public key client tidak ter-register di gateway | Compare `wg_public_key` di Supabase ↔ pubkey di gateway peer list | Trigger re-register: clear `wg_public_key` di Supabase, reconnect |
+| PSK mismatch | (tidak ada cara langsung) | Refresh config dari Supabase |
+| Endpoint IP berubah / DNS resolve gagal | `nslookup <gateway-host>` | `wg-quick down && up` (force re-resolve) |
+| MTU terlalu besar | `ping -M do -s 1372 <gw>` | Set `MTU = 1280` di config |
+| NAT timeout | Tidak ada keepalive | `PersistentKeepalive = 25` |
+
+**Diagnosa:**
+
+```bash
+# UDP test
+nc -uvz <gateway-host> 51820
+
+# Tcpdump (Mac/Linux)
+sudo tcpdump -i any -n udp port 51820 -vv
+
+# Manual reconnect
+sudo wg-quick down /etc/wireguard/Hermes.conf
+sudo wg-quick up /etc/wireguard/Hermes.conf
+```
+
+## 11.4 Tunnel up tapi internet tidak jalan
+
+| Penyebab | Cek | Fix |
+|---|---|---|
+| AllowedIPs tidak cover destination | `wg show Hermes allowed-ips` | Edit `wg_config` di Supabase |
+| Routing tidak ke tunnel interface | `route get 8.8.8.8` (Mac) / `Get-NetRoute` (Win) | Restart tunnel |
 | MTU drop packet | `ping -M do -s 1400 8.8.8.8` | Set MTU 1280 |
-| Gateway block specific traffic (corporate policy) | Test ke IP allowed dulu | Hubungi ops |
-| DNS leak / DNS broken | `nslookup example.com` | Set DNS di config, atau `dig @10.0.0.1 example.com` |
+| DNS broken | `nslookup example.com` | Verify DNS line di config |
+| Gateway-side block | Test ke IP allowed dulu | Hubungi ops |
 
-## 11.4 "Connection refused" saat call edge function
+## 11.5 SaseConfigClient: "wg_config kosong"
 
-**Gejala:** `RequestConfigAsync` throw `HttpRequestException`.
+**Gejala:** `GetConfigAsync()` throw "wg_config kosong di user_data".
 
-| Penyebab | Fix |
+**Penyebab:** Tabel `user_data` row user belum di-populate dengan `wg_config`.
+
+**Fix:**
+
+1. Verify dengan query:
+   ```sql
+   SELECT id, length(wg_config) FROM user_data WHERE id = '<user-uuid>';
+   ```
+2. Kalau NULL → koordinasi dengan ops untuk populate config
+3. Pastikan tooling admin generate per-user config + save ke Supabase
+
+## 11.6 SaseConfigClient: "user_data row not found"
+
+**Penyebab:**
+- User profile belum ter-create
+- RLS policy salah
+- JWT user invalid / expired
+
+**Fix:**
+
+```sql
+-- Verify row exists
+SELECT * FROM user_data WHERE id = '<user-uuid>';
+
+-- Verify RLS policy
+SELECT polname, qual FROM pg_policies WHERE tablename = 'user_data';
+```
+
+Kalau row hilang, create dulu (via trigger di `auth.users` atau manual):
+
+```sql
+INSERT INTO user_data (id) VALUES ('<user-uuid>') ON CONFLICT DO NOTHING;
+```
+
+## 11.7 Helper RPC error code -32001 ("Caller not authenticated")
+
+**Penyebab:** Caller authenticator reject — caller tidak punya identity yang valid.
+
+**Diagnosa:**
+- Apakah UI binary signed dengan cert yang Helper trust?
+- Apakah caller running dengan user identity yang dikenal?
+
+**Fix:**
+- Sign ulang UI binary dengan cert yang sama dengan Helper
+- Verify policy di `CallerAuthenticator` (mungkin terlalu ketat)
+
+## 11.8 Helper RPC error -32000 (validation failed)
+
+**Penyebab:** Input gagal validation:
+- Tunnel name regex mismatch
+- Config tidak ada `[Interface]` atau `[Peer]` section
+- Config terlalu besar (>16 KiB)
+
+**Fix:**
+- Cek config string yang di-pass ke `ApplyConfig`
+- Pastikan format INI valid (kalau pakai JSON di Supabase, parser converted ke INI)
+- Log config dengan PrivateKey + PSK redacted untuk debug
+
+## 11.9 Helper RPC error -32002 (OS operation failed)
+
+**Penyebab:** Command OS gagal — `wireguard.exe` exit non-zero, `wg-quick` error, `sc` access denied, dll.
+
+**Diagnosa:** Lihat `error.data` di response — biasanya forward stderr dari command yang gagal.
+
+**Fix tergantung error message:**
+- "Access denied" → Helper tidak running as SYSTEM/root → reinstall service
+- "File not found: wireguard.exe" → WG belum installed
+- "Service already exists" → uninstall existing tunnel dulu sebelum install ulang
+
+## 11.10 Performance: tunnel bandwidth rendah
+
+**Gejala:** Speed via tunnel jauh di bawah speed normal.
+
+```bash
+speedtest-cli                            # tanpa tunnel
+sudo wg-quick up /etc/wireguard/Hermes
+speedtest-cli                            # dengan tunnel
+```
+
+| Cause | Fix |
 |---|---|
-| Supabase URL salah | Verify env var `HNGUARD_SUPABASE_URL` |
-| Edge function tidak deployed | `supabase functions deploy sase-config` |
-| Edge function crash | Check Supabase logs, fix bug |
-| User JWT invalid / expired | Re-login user, refresh token |
+| MTU mismatch | Set `MTU = 1280` |
+| CPU encryption (laptop low-end) | (hardware limit) |
+| Gateway overload | Hubungi ops |
+| Routing path tidak optimal | Multi-region gateway selection (advanced) |
 
-## 11.5 "InvalidApiKey" dari edge function
+## 11.11 macOS: notarization issues
 
-**Gejala:** Edge function return 401 / 403 ke client.
+| Issue | Fix |
+|---|---|
+| Reject "Hardened runtime not enabled" | Re-sign dengan `--options runtime` |
+| Reject "Code object is not signed at all" | Sign semua dylib + executable + Helper binary di bundle |
+| Reject "Invalid signature" | Verify identity, regenerate p12 kalau perlu |
+| `spctl` reject signed app | Run `xcrun stapler staple` setelah notarization |
 
-```bash
-# Check log Supabase
-supabase functions logs sase-config --tail
+## 11.12 Reconnect loop
+
+**Gejala:** UI status flicker antara Connecting/Reconnecting/Faulted.
+
+**Penyebab:** Config tidak valid, gateway intermittent, atau monitor logic terlalu agresif.
+
+**Diagnosa:**
+
+```
+# Manual stable test (bypass monitor):
+sudo wg-quick down /etc/wireguard/Hermes
+sudo wg-quick up /etc/wireguard/Hermes
+watch -n 1 'wg show Hermes latest-handshakes'
 ```
 
-Cari pesan error spesifik. Biasanya:
+Kalau manual stable tapi via app tidak → bug di logic `MonitorLoopAsync`. Tambah verbose logging.
 
-- `Invalid token` → JWT user invalid, refresh user session
-- `SASE register failed: 401` → SASE_API_KEY di Supabase salah
-- `SASE register failed: 404` → endpoint API SASE salah
+## 11.13 KeyStore corrupt (Win DPAPI)
 
-**Fix SASE_API_KEY:**
-
-```bash
-supabase secrets set SASE_API_KEY=<correct-key>
-supabase functions deploy sase-config
-```
-
-## 11.6 "DPAPI failed to decrypt KeyStore"
-
-**Gejala:** App throw `CryptographicException` saat baca `keypair.json` di Windows.
+**Gejala:** `KeyStore.LoadAsync` throw `CryptographicException`.
 
 **Penyebab:**
 - File di-copy dari user lain (DPAPI tied to user account)
 - User profile rebuilt
 - Windows reinstall
 
-**Fix:** Delete file, generate keypair baru.
+**Fix:** Hapus file, generate ulang.
 
 ```powershell
 Remove-Item "$env:LOCALAPPDATA\HermesNetwork360Guard\Sase\keypair.json"
-# Klik Connect lagi → akan auto-generate keypair baru
+# UI klik Connect lagi → generate keypair baru
+# Public key baru di-publish ke user_data → admin tooling re-register
 ```
 
-## 11.7 macOS: "Operation not permitted" saat start tunnel
+## 11.14 "Config refresh tidak trigger"
 
-**Gejala:** osascript exit dengan "Operation not permitted" atau LaunchDaemon tidak load.
-
-| Cause | Check | Fix |
-|---|---|---|
-| App belum signed/notarized | `codesign --verify --deep <app>` | Re-sign + notarize |
-| LaunchDaemon plist permission salah | `ls -la /Library/LaunchDaemons/com.hermesnetwork.sase.plist` | `sudo chown root:wheel`, `chmod 644` |
-| User cancel password dialog | (no specific log) | Re-attempt, edukasi user |
-| SIP block | Check System Integrity Protection | Tidak relevan untuk binary di /usr/local/, harusnya OK |
-
-## 11.8 "Tunnel disconnect tiap 25 detik"
-
-**Gejala:** Tunnel up briefly, lalu drop, ulang setiap 25 detik.
-
-**Penyebab umum:** PSK mismatch. Handshake awal sukses karena WireGuard bisa fall back ke "no PSK" mode pada beberapa implementasi tua, tapi gateway expect PSK.
-
-**Fix:**
-1. Refresh config dari edge function
-2. Verify config baru ada PSK line
-3. Reconnect
-
-## 11.9 "Bytes counter tidak naik (no traffic)"
-
-**Gejala:** Handshake terlihat fresh, tapi `transfer: 0 B received, 0 B sent` selama menit.
+**Gejala:** Admin update `wg_config` di Supabase, tapi user tidak terapply.
 
 **Diagnosa:**
-
-```bash
-# Apakah ada apps yang push traffic?
-# Test ping ke IP yang ada di AllowedIPs
-ping 10.0.0.1
-
-# Apakah keepalive jalan?
-wg show Hermes persistent-keepalive
-# Should: 25 seconds
-
-# Tcpdump
-sudo tcpdump -i utun5 -n   # Mac (atau nama tunnel kamu)
-```
-
-Kalau `tcpdump` show no packet di interface tunnel → routing salah. Kalau show packet tapi reply tidak datang → gateway-side issue.
-
-## 11.10 macOS: "Client request edge function gagal — TLS error"
-
-**Gejala:** `HttpRequestException: The SSL connection could not be established`.
-
-**Penyebab:** macOS ATS (App Transport Security) block koneksi non-HTTPS atau cert tidak trusted.
+- Apakah Realtime subscription aktif?
+- Apakah polling 5 menit jalan?
 
 **Fix:**
-- Pastikan endpoint pakai HTTPS valid (Let's Encrypt OK)
-- Kalau staging pakai self-signed cert, tambah exception di `Info.plist`:
-
-```xml
-<key>NSAppTransportSecurity</key>
-<dict>
-  <key>NSExceptionDomains</key>
-  <dict>
-    <key>staging.supabase.co</key>
-    <dict>
-      <key>NSExceptionAllowsInsecureHTTPLoads</key>
-      <true/>
-    </dict>
-  </dict>
-</dict>
-```
-
-> JANGAN pakai exception di production — selalu HTTPS valid.
-
-## 11.11 "Reconnect loop" — tunnel up-down terus
-
-**Gejala:** UI status flicker antara "Connecting" dan "Reconnecting".
-
-**Penyebab:**
-- Config invalid (salah satu field) → start gagal → monitor detect → reconnect → ulang
-- Gateway intermittent
-- NAT terlalu agresif
-
-**Diagnosa:**
-
-```bash
-# Cek log Hermes app
-# cari pattern "SASE handshake stale" atau "Reconnect timeout"
-
-# Manual test stable connection (bypass monitor):
-sudo wg-quick down Hermes
-sudo wg-quick up Hermes
-# Tunggu 60 detik sambil
-watch -n 1 'wg show Hermes latest-handshakes'
-```
-
-Kalau manual stable tapi via app tidak → ada masalah di logic monitor service. Tambah logging detail.
-
-## 11.12 Performa: tunnel bandwidth rendah
-
-**Gejala:** Speed via tunnel jauh di bawah speed normal.
-
-**Penyebab umum:**
-- MTU terlalu besar / kecil
-- CPU encryption bottleneck (di laptop low-end)
-- Gateway overload
-- Routing path tidak optimal
-
-**Test:**
-
-```bash
-# Speedtest tanpa tunnel
-speedtest-cli
-
-# Up tunnel + speedtest lagi
-sudo wg-quick up Hermes
-speedtest-cli
-```
-
-Kalau drop > 50%, suspect MTU atau CPU. Test dengan MTU 1280:
-
-```ini
-[Interface]
-MTU = 1280
-```
-
-## 11.13 "Config refresh tidak trigger"
-
-**Gejala:** Admin update user role, tapi user tidak terapply policy baru.
-
-**Diagnosa:**
-
-```bash
-# 1. Check status di edge function
-curl "$SB_URL/functions/v1/sase-config/status?device=<id>" \
-  -H "Authorization: Bearer $JWT"
-# Expected: { fresh: false, reason: "role-changed" }
-```
-
-Kalau output `fresh: true` → user_profiles.sase_role belum di-update. Kalau `fresh: false` tapi client tidak refresh → masalah di monitor loop:
-
-```
-# Cek log app — apakah background monitor active?
-# Kalau tab SASE belum dibuka, monitor mungkin tidak start
-```
-
-**Fix:**
-- Pastikan user buka tab SASE atau force `RefreshConfigAsync()` dipanggil saat login
-- Tambah broadcast notification dari Supabase Realtime kalau role berubah
-
-## 11.14 Build / sign issues macOS
-
-| Issue | Fix |
-|---|---|
-| `notarytool` reject "Hardened runtime not enabled" | Re-sign dengan `--options runtime` |
-| `notarytool` reject "Code object is not signed at all" | Sign semua dylib + executable di bundle |
-| `spctl` reject signed app | Run `xcrun stapler staple` setelah notarization sukses |
-| Universal binary tidak jalan di Intel Mac | Verify lipo: `lipo -info HermesNetwork360Guard` |
+- Pastikan tab SASE dibuka (monitor active hanya saat connected)
+- Tambah broadcast notification dari trigger Supabase
+- Atau force user RefreshConfig manual
 
 ## 11.15 Diagnostic checklist untuk support ticket
 
-Saat user lapor masalah SASE, kumpulkan:
-
 - [ ] OS + version
 - [ ] Hermes Network 360 Guard version
-- [ ] Username / email Supabase
+- [ ] Helper Service version (`HermesHelperSvc --version`)
+- [ ] Username Supabase
 - [ ] Hostname endpoint
-- [ ] Output `wg show Hermes` (atau `wg show` saja)
-- [ ] Output `wg show Hermes latest-handshakes`
-- [ ] Output `nc -uvz n1.ndr24.com 51820`
-- [ ] Tail 100 lines `app.log` (decrypted kalau encrypted)
-- [ ] Tail 50 lines tunnel log
-- [ ] Screenshot UI saat error
+- [ ] `wg show Hermes` output
+- [ ] Helper service status (Win: `sc query` / Mac: `launchctl list`)
+- [ ] Tail 100 lines `app.log` (decrypted kalau ter-encrypt)
+- [ ] Tail 50 lines Helper error log
 - [ ] Steps to reproduce
-
-Bikin command shortcut "diagnose-sase" yang auto-collect ini ke zip.
+- [ ] Screenshot
 
 ## 11.16 Eskalasi
 
 | Skenario | Eskalasi ke |
 |---|---|
 | WireGuard kernel module crash | wireguard-tools upstream |
-| MeshCentral / TRMM tidak relevan dengan SASE — beda doc |
-| Edge function bug | Internal repo Hermes |
-| Bug di TunnelSupervisor | Internal repo Hermes |
+| Helper Service bug | Internal repo HermesHelperSvc |
+| Bug client `SaseConnectionService` / `SaseConfigClient` | Internal repo HermesNetwork360Guard |
+| Schema `user_data` issue | DBA + ops |
 | Gateway issue | Vendor SASE / ops Hermes |
-| Bug di Avalonia | [github.com/AvaloniaUI/Avalonia](https://github.com/AvaloniaUI/Avalonia) |
+| Bug Avalonia | [github.com/AvaloniaUI/Avalonia](https://github.com/AvaloniaUI/Avalonia) |
 
 ---
 

@@ -18,198 +18,162 @@ permalink: /docs/keamanan/
 
 ## 7.1 Prinsip dasar
 
-1. **Private key tidak pernah meninggalkan client device.**
-2. **API key SASE control plane hanya di server-side (Supabase Edge Function).**
-3. **PSK per-peer** untuk defense in depth.
-4. **Identity-aware AllowedIPs** — bukan flat policy untuk semua user.
-5. **Audit trail** semua request config + connection event.
+1. **Private key WireGuard tidak pernah meninggalkan client device** — disimpan di DPAPI/Keychain, di-inject oleh client saat apply config.
+2. **Helper Service adalah trust boundary lokal** — dia satu-satunya komponen yang punya privilege admin/root, dengan API minimal & well-defined.
+3. **Supabase RLS adalah trust boundary backend** — user hanya bisa lihat/edit row sendiri.
+4. **`wg_config` di Supabase di-populate admin (server_role)** — client tidak boleh ubah field ini.
+5. **PSK per-peer** disertakan dalam config untuk defense in depth.
 
-## 7.2 Threat model
+## 7.2 Trust boundaries
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Client device (Windows / Mac)                                  │
+│                                                                 │
+│  ┌─────────────────────────┐     named-pipe / unix-socket      │
+│  │  Hermes UI (user mode)  │ ←─── (validated, authenticated) ──┐│
+│  │  - User JWT             │                                   ││
+│  │  - WG private key       │                                   ││
+│  │   (DPAPI/Keychain)      │                                   ││
+│  └────────────┬────────────┘                                   ││
+│               │ HTTPS + JWT user                               ││
+│               ▼                                                ││
+│  ┌─────────────────────────┐                                   ││
+│  │ Supabase user_data      │  <── trust boundary 1 (RLS)       ││
+│  │ (read-only client side) │                                   ││
+│  └─────────────────────────┘                                   ││
+│                                                                ││
+│  ┌─────────────────────────────────────────────────────────────┘│
+│  │  Hermes Helper Service (LocalSystem / root)                   │
+│  │  - Stateless                                                  │
+│  │  - Verb whitelist                                             │
+│  │  - Caller authentication                                      │
+│  │  - No network access                                          │
+│  └────────────┬──────────────────────────────────────────────────┘
+│               │
+│               ▼
+│  ┌─────────────────────────┐
+│  │ wireguard.exe / wg-quick │  <── OS service / kernel
+│  └─────────────────────────┘
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 7.3 Threat model
 
 | Threat | Defended? | Mitigasi |
 |---|---|---|
-| Steal `.conf` file dari laptop user | ⚠️ Partial | DPAPI (Windows) / mode 0600 (Mac); attacker masih perlu PSK + bypass policy |
-| Reverse engineer desktop binary | ✅ | Tidak ada API key SASE / PSK di binary; hanya kode logic |
-| Compromise gateway (full takeover) | ❌ | Threat di-luar scope; rotate semua peer key |
-| Compromise edge function | ⚠️ | Rotate API key + audit log, scope kerusakan terbatas |
-| MITM antara client ↔ Edge Function | ✅ | HTTPS + (opsional) cert pinning |
-| MITM antara client ↔ gateway WireGuard | ✅ | Curve25519 ECDH + ChaCha20-Poly1305; PSK additional |
-| Replay attack pada WireGuard | ✅ | Built-in: nonce + counter |
-| Steal user JWT dari memory | ⚠️ Partial | TTL pendek (1 jam), refresh rotated |
-| User compromise (phishing) → enroll device attacker | ⚠️ | RBAC limit damage; admin bisa revoke peer cepat |
-| DNS leak | ✅ | DNS dari config + Windows split-tunnel rules |
-| IP leak (saat handshake bermasalah) | ✅ | Kill switch (lihat 7.7) |
+| Reverse-engineer UI binary → ekstrak credential | ✅ | Tidak ada API key privileged di binary; hanya anon key Supabase yang dilindungi RLS |
+| Steal `.conf` file di disk | ⚠️ Partial | Win: DPAPI encrypt; Mac: mode 0600 root-owned. Attacker juga butuh PSK kalau pakai PSK. |
+| Attack lewat IPC (user lain di multi-user system) | ✅ | Helper authenticate caller via Win token / Unix peer creds (lihat §7.5) |
+| User compromise → run binary jahat sebagai dia | ⚠️ | Helper accept dari user yang sama; bisa request operasi WireGuard. Mitigasi: signed binary check (lihat §7.6) |
+| Compromise Supabase admin (service_role) | ❌ | Out of scope — backend compromise = total game over. Audit + key rotation. |
+| Compromise gateway WireGuard | ❌ | Threat di-luar scope. Mitigasi: rotate semua peer keys. |
+| MITM antara UI ↔ Supabase | ✅ | HTTPS + (opsional) cert pinning |
+| MITM antara UI ↔ Helper (named pipe / unix socket) | ✅ | Lokal kernel — tidak melewati network. Authenticate caller. |
+| MITM antara client ↔ gateway WG | ✅ | WireGuard ChaCha20-Poly1305 + Curve25519 + (opsional) PSK |
+| Replay attack pada WireGuard handshake | ✅ | Built-in: nonce + counter |
+| Steal user JWT dari memory | ⚠️ Partial | TTL 1 jam, refresh rotated, simpan refresh di OS keychain |
+| DNS leak | ✅ | DNS dari `wg_config`, plus split-tunnel rules |
+| IP leak saat handshake bermasalah | ✅ | Kill switch (lihat §7.7) |
 
-## 7.3 Aliran kunci & kepercayaan
+## 7.4 Aliran kunci & data sensitif
 
-```
-┌────────────────────────────────────────────────────┐
-│  Client device                                     │
-│   - private_key  (DPAPI / 0600 file)               │
-│   - public_key   (di-kirim ke edge function)       │
-│   - psk          (di-kirim dari edge function,     │
-│                   disimpan di config aktif)        │
-│   - user_jwt     (DPAPI / Keychain)                │
-└─────────────────┬──────────────────────────────────┘
-                  │ HTTPS + Bearer JWT
-                  ▼
-┌────────────────────────────────────────────────────┐
-│  Supabase Edge Function (sase-config)              │
-│   - SASE_API_KEY  (env secret)                     │
-│   - SASE_GATEWAY_PUBLIC_KEY (env config)           │
-└─────────────────┬──────────────────────────────────┘
-                  │ HTTPS + API key
-                  ▼
-┌────────────────────────────────────────────────────┐
-│  SASE control plane                                │
-│   - All peer pub keys + PSK                        │
-└─────────────────┬──────────────────────────────────┘
-                  │ deploy peer config
-                  ▼
-┌────────────────────────────────────────────────────┐
-│  SASE gateway (WireGuard)                          │
-│   - own private_key                                │
-│   - all peer public_key + PSK                      │
-└────────────────────────────────────────────────────┘
-```
+| Asset | Disimpan di mana | Kapan ada di memori | Yang boleh akses |
+|---|---|---|---|
+| WG private key | Client DPAPI / Keychain | Hanya saat inject ke config string sebelum kirim ke Helper | UI app |
+| WG public key | Plaintext di `KeyStore`; di-publish ke `user_data.wg_public_key` | Selalu | UI + admin (untuk register peer) |
+| PSK | Inside `wg_config` from Supabase | Hanya saat read + relay ke Helper | UI temp + Helper file |
+| User JWT | OS keychain encrypted | Saat HTTP request | UI app |
+| Supabase service_role key | **TIDAK ADA di client** | N/A | Hanya backend / admin |
+| Helper IPC pipe | Kernel-managed | N/A | Process yang punya akses |
 
-**Yang BOLEH di client device:**
-- Private key WireGuard (terkurung dengan DPAPI / mode 0600)
-- PSK (sama, terkurung)
-- Public key gateway (publik, OK)
-- User JWT (terkurung di OS keychain)
-- Supabase anon key (publik, dilindungi RLS)
+## 7.5 Caller authentication ke Helper
 
-**Yang TIDAK BOLEH di client device:**
-- SASE control plane API key
-- Supabase service role key
-- Gateway private key
-- API key TRMM
+### 7.5.1 Windows
 
-## 7.4 Pre-Shared Key (PSK)
+`NamedPipeServerStream` punya `RunAsClient` yang impersonate caller. Bisa ambil `WindowsIdentity` dan check:
 
-PSK adalah symmetric secret yang ditambahkan ke handshake WireGuard. Dampak:
-
-- Tanpa PSK: handshake ChaCha20-Poly1305 + Curve25519 ECDH
-- Dengan PSK: hash PSK tambahan masuk ke key derivation
-
-Manfaat:
-- Defense terhadap **future quantum attack** pada Curve25519 (PSK adalah secret simetrik, kuat terhadap quantum)
-- Kalau private key bocor (mis. lewat memory dump), attacker masih perlu PSK untuk handshake
-- Memungkinkan rotasi PSK terpisah dari rotasi keypair
-
-Cara generate PSK:
-
-```bash
-wg genpsk
-# Output: base64 32-byte
-```
-
-Di Edge Function (lihat Bab 5), PSK di-generate per-peer di control plane (atau Edge Function bisa generate juga kalau control plane tidak support).
-
-## 7.5 Key rotation
-
-### 7.5.1 Per-device WireGuard keypair
-
-Generate sekali, simpan di `KeyStore`. Rotate kalau:
-
-- User suspect device compromise → reset KeyStore + re-enroll
-- Device formatting / OS reinstall → auto-regenerate (KeyStore hilang)
-- Annual hygiene rotation
-
-User-driven rotation:
+- Apakah user yang sama dengan yang menjalankan `HermesNetwork360Guard.exe`?
+- Atau group membership tertentu?
 
 ```csharp
-public async Task RotateKeyAsync()
+public sealed class WindowsCallerAuthenticator
 {
-    // 1. Disconnect current
-    await _conn.DisconnectAsync();
+    public bool Authenticate(NamedPipeServerStream pipe)
+    {
+        WindowsIdentity? callerId = null;
+        pipe.RunAsClient(() =>
+        {
+            callerId = WindowsIdentity.GetCurrent();
+        });
+        if (callerId is null) return false;
 
-    // 2. Wipe KeyStore
-    await _keyStore.DeleteAsync();
-
-    // 3. Reconnect — generate keypair baru, register peer baru di control plane
-    await _conn.ConnectAsync();
-
-    // 4. (Opsional) Edge function revoke peer lama yang punya pubkey hilang
-    //    Implementasikan di edge function: kalau public_key yang masuk berbeda
-    //    untuk (user_id, device_id) yang sama, revoke yang lama
+        // Policy: hanya terima dari user yang sedang interactive di session yang sama
+        // Untuk simple: trust kalau caller adalah Authenticated User
+        return callerId.IsAuthenticated;
+    }
 }
 ```
 
-### 7.5.2 PSK rotation
+Lebih ketat: simpan PID + username UI app saat install, di Helper check apakah caller punya identity sama.
 
-Otomatis tiap config refresh (24 jam default). Tidak ada user action.
+### 7.5.2 macOS / Linux
 
-### 7.5.3 SASE API key (server-side)
+Pakai `getpeereid()` (macOS) atau `SO_PEERCRED` (Linux) untuk dapat UID + GID peer:
 
-Rotate tiap **6 bulan** atau saat indikasi compromise:
+```csharp
+[DllImport("libc")]
+private static extern int getpeereid(int sockfd, out uint euid, out uint egid);
 
-1. Generate API key baru di SASE control plane dashboard
-2. `supabase secrets set SASE_API_KEY=<new>`
-3. Redeploy edge function
-4. Test
-5. Delete API key lama
+public bool AuthenticateMacPeer(Socket sock)
+{
+    var fd = (int)sock.Handle;
+    if (getpeereid(fd, out var euid, out var egid) != 0)
+        return false;
 
-Tidak ada client-side change.
-
-### 7.5.4 Gateway WireGuard private key
-
-Hanya rotate kalau **gateway compromise**. Setelah rotate:
-
-1. Update `SASE_GATEWAY_PUBLIC_KEY` di Supabase secrets
-2. Edge function akan return public key baru ke client di config refresh berikutnya
-3. Force semua client refresh dalam 5 menit (via flag di edge function "force-refresh-all")
-
-## 7.6 Identity-aware policy
-
-Saat user role berubah di Supabase (mis. `intern` → `engineer`), policy di edge function mengembalikan AllowedIPs baru di config refresh berikutnya. Implementasi:
-
-```typescript
-// di handleStatus()
-if (profile?.sase_role !== peer.role_at_issue) {
-  return jsonOk({ fresh: false, reason: "role-changed" });
+    // Policy: hanya terima dari user yang punya session GUI aktif (atau dari list approved UIDs)
+    return euid >= 500;   // skip system accounts
 }
 ```
 
-Client polling `IsConfigFreshAsync` tiap 5 menit, dapat `fresh: false` → trigger `RefreshConfigAsync`.
+Permission socket file `/var/run/hermes-helper.sock` di-set 0666 (semua user bisa connect) atau 0660 dengan group khusus, tergantung policy.
 
-User experience: tidak ada drop koneksi (WireGuard handle peer config update tanpa restart koneksi), AllowedIPs efektif berubah dalam 5–10 menit dari momen role di-update.
+### 7.5.3 Pencegahan replay
 
-### 7.6.1 Revoke akses individual
+JSON-RPC frame **tidak** signed atau timestamped saat ini. Karena IPC tidak melewati network, replay attack hanya relevan kalau attacker sudah dapat akses ke pipe/socket lokal — yang berarti dia sudah punya privilege user. Tambahan signing tidak menambah security signifikan.
 
-Untuk admin yang ingin segera cabut akses user (compromise / resign):
+## 7.6 Helper integrity
 
-```sql
-UPDATE sase_peer
-SET status = 'revoked'
-WHERE user_id = '<user-uuid>';
+### 7.6.1 Signed binary
+
+Helper dan UI **harus signed dengan signing identity yang sama**:
+- Windows: Authenticode signed dengan EV / OV cert
+- macOS: Developer ID Application
+
+Pada install, OS verify signature. Saat runtime, Helper bisa **verify caller signature** untuk meningkatkan kepercayaan:
+
+```csharp
+// Windows: cek signature dari process binary caller
+public bool VerifyCallerSignature(int callerPid)
+{
+    var process = Process.GetProcessById(callerPid);
+    var binPath = process.MainModule?.FileName;
+    if (binPath is null) return false;
+
+    // Pakai WinVerifyTrust API atau cek subject di Authenticode
+    return AuthenticodeVerifier.IsSignedBy(binPath, "Hermes Network Inc.");
+}
 ```
 
-Edge function refuse return config kalau status = revoked → user reconnect = HTTP 403.
+### 7.6.2 Update protection
 
-Kalau user **sedang connected**: tunggu config TTL expire (max 24 jam) atau force disconnect via:
-
-```typescript
-// PUT request di control plane untuk hapus peer
-await fetch(`${SASE_API_URL}/peers/${publicKey}`, {
-  method: "DELETE",
-  headers: { Authorization: `Bearer ${SASE_API_KEY}` }
-});
-```
-
-Setelah peer dihapus, gateway drop semua trafik → user effectively disconnected dalam < 1 menit.
+Helper binary dilindungi oleh ACL Windows Service file (default: hanya admin yang bisa overwrite). Updater Hermes harus jalan sebagai admin saat replace binary — lewat trusted updater service / package manager (e.g. MSIX update).
 
 ## 7.7 Kill switch
 
-Saat tunnel **harus** up tapi handshake gagal (gateway down, network filter), kita harus pilih:
+Untuk role yang sensitive (executive / contractor), tunnel **harus** up; kalau gagal, semua trafik di-block (no leak).
 
-- **Soft fail** — tunnel down, semua trafik lewat normal interface
-- **Hard fail (kill switch)** — tidak ada trafik kecuali yang lewat tunnel
-
-Untuk role yang sensitive (executive dengan AllowedIPs `0.0.0.0/0`), kill switch wajib.
-
-Cara implement di WireGuard config:
+WireGuard config dengan kill switch (Linux/Mac):
 
 ```ini
 [Interface]
@@ -217,124 +181,154 @@ PrivateKey = ...
 Address = 10.99.0.42/32
 PostUp   = iptables -I OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
 PreDown  = iptables -D OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
-
-[Peer]
-...
-AllowedIPs = 0.0.0.0/0
 ```
 
-Di Windows pakai feature `BlockUntunneledTraffic` di adapter setting, atau set `AllowedIPs = 0.0.0.0/0` + Windows firewall rule yang block non-tunnel egress.
+Windows pakai `BlockUntunneledTraffic` adapter setting atau Windows Firewall rule:
 
-Kill switch best implemented di Edge Function — tambah field `kill_switch: true` di policy untuk role executive, client interpret saat build wg config.
+```powershell
+# Helper register firewall rule saat tunnel UP
+New-NetFirewallRule -DisplayName "Hermes-SASE-KillSwitch" `
+  -Direction Outbound -InterfaceAlias "Hermes" -Action Allow
+New-NetFirewallRule -DisplayName "Hermes-SASE-KillSwitch-Block" `
+  -Direction Outbound -Action Block -Profile Any
+```
+
+Kill switch best implemented sebagai field policy di `wg_config` (admin set per user). Helper interpret dan apply firewall rule.
 
 ## 7.8 DNS leak prevention
 
 Set `DNS = ...` di interface block. Untuk Windows, ini install resolver di adapter tunnel. Untuk Mac, `wg-quick` jalankan `resolvconf` setup.
 
-Verifikasi tidak leak:
+Verifikasi tidak leak setelah connect:
 
 ```bash
-# Saat tunnel UP, check DNS server
-# Windows
+# Win
 Get-DnsClientServerAddress
 
 # Mac
 scutil --dns | head -20
 
-# Test query DNS via tunnel only
+# Test
 nslookup example.com
-# Server should be DNS yang di-set di config, BUKAN ISP user
+# Server harus DNS dari config (mis. 10.0.0.1), bukan ISP
 ```
 
-Untuk paranoid mode, set firewall rule yang block port 53 ke semua interface kecuali tunnel.
+## 7.9 Storage credentials
 
-## 7.9 Storage refresh token & PSK
-
-Sudah dibahas di Bab 5 §5.5 (KeyStore). Ringkasan:
-
-| Platform | Storage |
-|---|---|
-| Windows | `%LOCALAPPDATA%\HermesNetwork360Guard\Sase\keypair.json` (DPAPI) |
-| macOS | `~/Library/Application Support/HermesNetwork360Guard/Sase/keypair.json` (mode 0600) |
-| (Future) macOS Keychain | `kSecClassGenericPassword` dengan service `com.hermesnetwork.sase` |
-
-PSK disimpan di `.conf` file yang di-apply ke OS service:
-
-| Platform | Config file |
-|---|---|
-| Windows | `C:\Program Files\WireGuard\Data\Configurations\<name>.conf.dpapi.aes` (DPAPI) |
-| macOS | `/etc/wireguard/<name>.conf` (mode 0600 root:wheel) |
+| Asset | Windows | macOS |
+|---|---|---|
+| WG keypair | `%LOCALAPPDATA%\HermesNetwork360Guard\Sase\keypair.json` (DPAPI) | `~/Library/Application Support/HermesNetwork360Guard/Sase/keypair.json` (mode 0600) |
+| Supabase refresh token | `%LOCALAPPDATA%\HermesNetwork360Guard\session.bin` (DPAPI) | macOS Keychain via `/usr/bin/security` |
+| Helper config | N/A (stateless) | N/A |
+| WG `.conf` (active) | `C:\Program Files\WireGuard\Data\Configurations\<name>.conf.dpapi.aes` | `/etc/wireguard/<name>.conf` (root:wheel, 0600) |
 
 ## 7.10 Audit logging
 
 ### 7.10.1 Yang harus di-log
 
-| Event | Lokasi log | Retention |
+| Event | Lokasi | Retention |
 |---|---|---|
-| Config request / refresh | `sase_audit_log` table | indefinite |
-| Connect / disconnect | Hermes app log + Supabase audit | 30 hari |
-| Reconnect attempt (auto) | Hermes app log | 7 hari |
-| Bytes transferred (periodik) | Supabase audit (sample 1/jam) | 30 hari |
-| Peer revoked by admin | `sase_audit_log` + control plane | indefinite |
+| Helper RPC request | Event Viewer (Win) / `os_log` (Mac) | 30 hari |
+| Connect / Disconnect | Hermes app log + Supabase `user_data.wg_status` | 30 hari |
+| Reconnect attempt | App log | 7 hari |
+| Config refresh | App log + Supabase audit | 30 hari |
+| Auth failure di Helper | Event Viewer warning | 90 hari |
+| `wg_config` change (admin) | Supabase trigger log | indefinite |
 
 ### 7.10.2 Yang JANGAN di-log
 
-- PrivateKey dalam bentuk apa pun
-- PSK
-- SASE API key
+- WG private key, PSK
+- User JWT raw value
+- Full WG config (mengandung private key)
 - Refresh token
-- Full WireGuard config (mengandung private key + PSK)
+- Supabase service_role / admin tokens
 
 Pattern aman:
 
 ```csharp
-_log.LogInformation("SASE config refreshed for device {Device} role {Role}",
-    deviceId, configDto.Peers[0].AllowedIPs);
-// JANGAN: _log.LogInformation("Config: {Config}", configDto);   ❌
+_log.LogInformation("Helper RPC: {Method} duration_ms={Duration}", method, duration);
+// JANGAN: _log.LogInformation("Config: {Config}", configIni);   ❌
 ```
 
-## 7.11 Edge function security checklist
+### 7.10.3 Audit table di Supabase
 
-Sebelum deploy `sase-config` ke produksi:
+```sql
+CREATE TABLE IF NOT EXISTS sase_audit_log (
+    id           BIGSERIAL PRIMARY KEY,
+    user_id      UUID NOT NULL REFERENCES auth.users(id),
+    action       TEXT NOT NULL,           -- 'connect' | 'disconnect' | 'refresh' | 'error'
+    detail       JSONB,                    -- { hostname, public_ip, ... }
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-- [ ] **JWT validation** — semua endpoint validate via `supabase.auth.getUser()`
-- [ ] **Service role key** — di-set via `supabase secrets`, bukan kode
-- [ ] **SASE API key** — di-set via `supabase secrets`
-- [ ] **CORS** — explicit origin di production (Hermes Guard distributable)
-- [ ] **Input validation** — sanitize device_id, hostname, public_key
-- [ ] **Rate limiting** — Supabase Edge Function default 60 req/min/IP
-- [ ] **No secret leakage** — error messages tidak include API key / config
-- [ ] **Audit log enable** — `sase_audit_log` populated untuk setiap request
-- [ ] **RLS enabled** di `sase_peer` table
+ALTER TABLE sase_audit_log ENABLE ROW LEVEL SECURITY;
+
+-- User bisa insert audit untuk dirinya
+CREATE POLICY "users_insert_own_audit"
+  ON sase_audit_log FOR INSERT
+  WITH CHECK (auth.uid() = user_id);
+
+-- User cuma bisa baca milik sendiri (admin lewat service_role)
+CREATE POLICY "users_read_own_audit"
+  ON sase_audit_log FOR SELECT
+  USING (auth.uid() = user_id);
+```
+
+Client report:
+
+```csharp
+await _http.PostAsync($"{_supabaseUrl}/rest/v1/sase_audit_log",
+    JsonContent.Create(new
+    {
+        action = "connect",
+        detail = new { last_handshake = hs, public_ip = await GetPublicIpAsync() }
+    }));
+```
+
+## 7.11 Key rotation
+
+### 7.11.1 Per-device WG keypair
+
+User-driven rotation kalau curiga compromise:
+
+```csharp
+public async Task RotateKeyAsync()
+{
+    await _conn.DisconnectAsync();
+    await _keyStore.DeleteAsync();           // wipe lokal
+    // Connect → KeyStore generate baru → push ke Supabase user_data.wg_public_key
+    await _conn.ConnectAsync();
+    // Admin tooling akan detect public_key change dan re-register peer
+}
+```
+
+### 7.11.2 PSK
+
+PSK ada di `wg_config` di Supabase. Rotasi = admin update kolom `wg_config` → client refresh otomatis dalam 5 menit.
+
+### 7.11.3 Helper signing certificate
+
+Apple Developer ID + Windows Authenticode cert: rotate sebelum expire. Re-sign + re-deploy installer. Tunnel tetap jalan dengan binary lama sampai user update.
 
 ## 7.12 Compliance considerations
 
-Kalau Hermes Network 360 Guard tunduk pada standar tertentu:
-
-| Standar | Yang relevan |
+| Standar | Yang relevan dari arsitektur ini |
 |---|---|
-| **SOC 2** | Audit trail config request, key rotation policy, access revocation procedure |
-| **ISO 27001** | Threat model di sini, incident response untuk gateway compromise |
-| **HIPAA** | BAA dengan vendor SASE, encryption at rest untuk audit log |
-| **GDPR** | Data minimization (jangan log unnecessary PII), right-to-erasure flow |
+| **SOC 2** | Audit trail di `sase_audit_log`, RLS enforcement, key rotation procedure |
+| **ISO 27001** | Threat model di sini, incident response, helper signed binary |
+| **HIPAA** | BAA dengan Supabase host, encryption at rest, audit retention |
+| **GDPR** | Data minimization (logging policy), right-to-erasure (delete user → cascade audit) |
 
 ## 7.13 Disaster recovery
 
-### 7.13.1 SASE control plane down
-
-→ Existing tunnel keep working sampai TTL expire (24 jam). User baru tidak bisa enroll. Restart control plane → semua kembali normal.
-
-### 7.13.2 Edge function compromise
-
-→ Rotate `SASE_API_KEY` immediately, audit `sase_audit_log` untuk indikasi abuse, force disconnect semua peer yang dicurigai.
-
-### 7.13.3 Gateway hardware failure
-
-→ Failover ke gateway backup (kalau ada). Update `SASE_GATEWAY_ENDPOINT` di Supabase secrets, semua client auto-refresh dalam 5 menit.
-
-### 7.13.4 KeyStore client hilang
-
-→ User reconnect → KeyStore kosong → generate keypair baru → register peer baru. Lama (sebelumnya) di-revoke otomatis di edge function (lihat 7.5.1).
+| Skenario | Action |
+|---|---|
+| Helper Service crash / unresponsive | UI tampilkan banner "Helper not running, please reinstall". Re-register service via installer. |
+| Supabase tidak reachable | Cached config terakhir di-pakai (kalau ada). Tunnel tetap up. |
+| Gateway WG down | Health monitor detect, status "Faulted". User notif. |
+| Compromise gateway | Rotate gateway key + update semua user_data wg_config. Force refresh. |
+| User device hilang/dicuri | Admin set `user_data.wg_public_key = null` + revoke peer di gateway. Tunnel drop dalam ~3 menit. |
+| Compromise Supabase admin | Rotate service_role key. Audit semua change `wg_config`. |
 
 ---
 

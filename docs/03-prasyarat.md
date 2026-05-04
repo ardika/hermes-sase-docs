@@ -16,242 +16,316 @@ permalink: /docs/prasyarat/
 
 ---
 
-## 3.1 SASE Gateway
+## 3.1 Supabase self-hosted
 
-Anda perlu akses ke gateway SASE yang sudah berjalan. Hermes Network menggunakan:
+Hermes Network menggunakan **Supabase self-hosted** untuk auth + database. Implikasi yang relevan untuk dokumen ini:
 
-| Komponen | URL / endpoint |
-|---|---|
-| SASE gateway | `n1.ndr24.com:51820/UDP` |
-| SASE control plane API | (vendor-specific — minta detail dari ops) |
-
-Kalau Anda perlu instance staging, ikuti panduan vendor SASE Anda untuk men-deploy gateway dan control plane.
-
-### 3.1.1 Membuat API key untuk control plane
-
-Untuk Edge Function bisa men-register peer secara otomatis, butuh API key dari control plane SASE:
-
-1. Login ke dashboard admin gateway
-2. Pergi ke **Settings → API Keys**
-3. Buat key dengan scope **peer:read,write** (atau setara)
-4. Salin key — disimpan di Supabase secrets, bukan di binary
-
-> **Penting:** API key ini **hanya boleh disimpan di Supabase Edge Function**, jangan pernah embed di desktop client. Detail di [Bab 7]({{ site.baseurl }}{% link docs/07-keamanan.md %}).
-
-### 3.1.2 Tentukan range AllowedIPs untuk tiap role
-
-Salah satu manfaat refactor adalah **per-role AllowedIPs** (split-tunnel berbasis policy). Sebelum coding, definisikan kebijakan dengan tim ops:
-
-| Role | AllowedIPs | Catatan |
+| Fitur Supabase | Self-hosted | Catatan |
 |---|---|---|
-| `engineer` | `10.0.0.0/8, 192.168.0.0/16` | Akses internal corporate network |
-| `executive` | `0.0.0.0/0` | Full tunnel — semua trafik via gateway |
-| `intern` | `10.10.0.0/16` | Hanya subnet tertentu |
-| `contractor` | `10.20.5.0/24` | Akses minimal ke 1 server |
+| Auth (GoTrue) | ✅ Ada | login user + JWT |
+| PostgREST | ✅ Ada | direct REST ke Postgres |
+| Realtime | ✅ Ada | subscription event row changes |
+| RLS (Row Level Security) | ✅ Ada (Postgres native) | wajib enabled untuk `user_data` |
+| Storage | ✅ Ada | tidak relevan untuk SASE |
+| **Edge Functions** | ❌ **TIDAK ADA** | self-hosted tidak include Deno runtime |
 
-Mapping ini akan disimpan di Supabase atau di-hardcode di Edge Function (tergantung preferensi).
+**Implikasi arsitektur:**
+- Client query `user_data` **langsung via PostgREST** (HTTPS + JWT, RLS-protected)
+- Tidak ada Edge Function untuk proxy / business logic. Kalau perlu logic server-side, deploy REST service terpisah (mis. FastAPI di server Supabase yang sama).
+- Realtime subscription opsional untuk push update — kalau tidak available di deployment, fallback ke polling.
+
+### 3.1.1 Verifikasi PostgREST + RLS
+
+Test akses PostgREST dari mesin development:
+
+```bash
+# Login user untuk dapat JWT
+curl -X POST "$SUPABASE_URL/auth/v1/token?grant_type=password" \
+  -H "apikey: $ANON_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@hermes","password":"..."}' | jq -r .access_token
+
+# Query user_data
+curl "$SUPABASE_URL/rest/v1/user_data?select=wg_config" \
+  -H "apikey: $ANON_KEY" \
+  -H "Authorization: Bearer $JWT"
+# Expected: array dengan satu row (RLS filter ke user yang login)
+```
+
+### 3.1.2 Schema `user_data`
+
+Pastikan tabel sudah punya kolom yang diperlukan:
+
+```sql
+-- Cek kolom existing
+\d user_data;
+```
+
+Kolom yang dipakai (sesuaikan dengan schema actual):
+
+| Kolom | Type | Tujuan |
+|---|---|---|
+| `id` | UUID PK (FK ke `auth.users`) | identifier user |
+| `wg_config` | TEXT | full INI WireGuard, atau JSON dengan field structured |
+| `wg_public_key` | TEXT (opsional) | tempat client write-back pubkey untuk admin register |
+| `wg_status` | TEXT (opsional) | last reported status (connected/disconnected/error) |
+| `wg_last_handshake` | TIMESTAMPTZ (opsional) | client report periodic |
+
+Kalau `wg_config` belum ada, tambahkan via migration:
+
+```sql
+ALTER TABLE user_data
+  ADD COLUMN IF NOT EXISTS wg_config TEXT,
+  ADD COLUMN IF NOT EXISTS wg_public_key TEXT,
+  ADD COLUMN IF NOT EXISTS wg_last_handshake TIMESTAMPTZ;
+
+-- RLS: user hanya bisa baca/update row sendiri
+ALTER TABLE user_data ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "users_select_own_data"
+  ON user_data FOR SELECT USING (auth.uid() = id);
+
+CREATE POLICY "users_update_own_data"
+  ON user_data FOR UPDATE USING (auth.uid() = id)
+  WITH CHECK (auth.uid() = id);
+```
+
+> **Penting:** kolom yang **boleh** di-update oleh client = `wg_public_key`, `wg_last_handshake`. Kolom `wg_config` di-populate oleh ops/admin (proses di luar scope dokumen ini), client read-only.
+
+Untuk enforce update column-level, gunakan trigger atau column-specific policy:
+
+```sql
+-- Block update kalau user coba ubah wg_config (read-only buat client)
+CREATE OR REPLACE FUNCTION protect_wg_config()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.wg_config IS DISTINCT FROM OLD.wg_config THEN
+    RAISE EXCEPTION 'wg_config is read-only for users';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_protect_wg_config
+  BEFORE UPDATE ON user_data FOR EACH ROW
+  EXECUTE FUNCTION protect_wg_config();
+```
 
 ## 3.2 WireGuard di endpoint
 
 ### 3.2.1 Windows
 
-WireGuard for Windows resmi tersedia di [wireguard.com/install](https://www.wireguard.com/install/). Yang dipakai:
+WireGuard for Windows resmi: [wireguard.com/install](https://www.wireguard.com/install/). Yang dipakai:
 
-| File | Lokasi default | Fungsi |
-|---|---|---|
-| `wireguard.exe` | `C:\Program Files\WireGuard\` | UI + CLI installer untuk tunnel service |
-| `wg.exe` | `C:\Program Files\WireGuard\` | CLI untuk query status (`wg show`) |
-| Tunnel service | `WireGuardTunnel$<TunnelName>` di Service Manager | Service per tunnel |
-| Config | `C:\Program Files\WireGuard\Data\Configurations\<TunnelName>.conf.dpapi.aes` | Encrypted dengan DPAPI |
+| File | Lokasi default |
+|---|---|
+| `wireguard.exe` | `C:\Program Files\WireGuard\` |
+| `wg.exe` | `C:\Program Files\WireGuard\` |
+| Tunnel service | `WireGuardTunnel$<TunnelName>` |
+| Config | `C:\Program Files\WireGuard\Data\Configurations\<TunnelName>.conf.dpapi.aes` |
 
-Installer Hermes harus **bundle WireGuard installer** atau **download saat first run**. Versi minimum: 0.5.3.
-
-```powershell
-# Verifikasi installed
-Get-Command wireguard -ErrorAction SilentlyContinue
-& "C:\Program Files\WireGuard\wireguard.exe" /version
-```
+Bundle WireGuard installer di `.msi` Hermes 360 Guard atau download saat first run.
 
 ### 3.2.2 macOS
 
-Dua opsi:
-
-| Opsi | Pro | Con |
-|---|---|---|
-| **WireGuard.app** dari Mac App Store | UI built-in, Network Extension, sandboxed | Susah otomasi, butuh user interaction |
-| **wireguard-go + wg-quick** (Homebrew / pkg) | Full automation via CLI | Harus jalan sebagai LaunchDaemon, butuh signed kalau didistribusikan |
-
-Untuk Hermes Network 360 Guard yang butuh otomasi, gunakan **wireguard-go + wg-quick** lewat install package custom:
+Gunakan `wireguard-go + wg-quick` (CLI), bukan WireGuard.app dari App Store:
 
 ```bash
-# Test install (Homebrew, dev only)
+# Install dari Homebrew (dev) atau bundle di .pkg Hermes (prod)
 brew install wireguard-tools
 
 # Verifikasi
-which wg
-which wg-quick
+which wg-quick     # /usr/local/bin/wg-quick
 wg --version
 ```
 
-Untuk distribusi production, package `.pkg` install:
-- `/usr/local/bin/wg`
-- `/usr/local/bin/wg-quick`
-- `/usr/local/bin/wireguard-go`
-- LaunchDaemon plist di `/Library/LaunchDaemons/com.hermesnetwork.sase.plist`
+Detail signing + bundle binary di [Bab 8 — macOS]({{ site.baseurl }}{% link docs/08-mac-support.md %}).
 
-Detail signing + notarization di [Bab 8 — Mac Support]({{ site.baseurl }}{% link docs/08-mac-support.md %}).
+## 3.3 Hermes Helper Service
 
-## 3.3 Development environment
+Helper Service adalah komponen terpisah dari `HermesNetwork360Guard.exe`. Diinstall via:
 
-### 3.3.1 Tooling .NET
-
-| Tool | Versi minimum | Catatan |
+| Platform | Mekanisme | Lokasi binary |
 |---|---|---|
-| .NET SDK | 8.0 | Pakai 8.0.x latest stable |
-| Avalonia | 11.x | Sudah ada di project |
+| Windows | Installer `.msi` register Windows Service | `C:\Program Files\Hermes Network\HermesHelperSvc.exe` |
+| macOS | Installer `.pkg` drop binary + LaunchDaemon plist | `/usr/local/bin/HermesHelperSvc` |
+
+**Privilege saat install:** installer minta UAC / admin password sekali. Setelah itu service jalan persistent sebagai SYSTEM/root, tidak butuh user interaction lagi.
+
+### 3.3.1 Installer responsibility
+
+Selama install Hermes 360 Guard:
+
+1. Install `HermesNetwork360Guard.exe` ke `C:\Program Files\Hermes Network\` (atau `/Applications/` di Mac)
+2. Install `HermesHelperSvc.exe` di lokasi yang sama
+3. Bundle WireGuard binaries (`wireguard.exe`, `wg.exe`, atau `wg`/`wg-quick` di Mac)
+4. Register Helper sebagai service:
+
+   **Windows:**
+   ```powershell
+   sc create HermesHelperSvc `
+     binPath= "C:\Program Files\Hermes Network\HermesHelperSvc.exe" `
+     start= auto `
+     obj= LocalSystem
+   sc start HermesHelperSvc
+   ```
+
+   **macOS:**
+   ```bash
+   sudo cp com.hermesnetwork.helper.plist /Library/LaunchDaemons/
+   sudo chown root:wheel /Library/LaunchDaemons/com.hermesnetwork.helper.plist
+   sudo chmod 644 /Library/LaunchDaemons/com.hermesnetwork.helper.plist
+   sudo launchctl bootstrap system /Library/LaunchDaemons/com.hermesnetwork.helper.plist
+   ```
+
+5. Helper otomatis listen di named-pipe / unix-socket — UI bisa connect tanpa elevation tambahan
+
+### 3.3.2 Path konvensi
+
+| Resource | Windows | macOS |
+|---|---|---|
+| Helper binary | `C:\Program Files\Hermes Network\HermesHelperSvc.exe` | `/usr/local/bin/HermesHelperSvc` |
+| Named-pipe | `\\.\pipe\HermesHelper` | (Mac unix-socket) |
+| Unix-socket | N/A | `/var/run/hermes-helper.sock` |
+| Helper log | Event Viewer (Source: HermesHelperSvc) | `os_log` (subsystem `com.hermesnetwork.helper`) |
+| Hermes Guard config | `%LOCALAPPDATA%\HermesNetwork360Guard\` | `~/Library/Application Support/HermesNetwork360Guard/` |
+
+## 3.4 Development environment
+
+### 3.4.1 .NET tooling
+
+| Tool | Versi | Catatan |
+|---|---|---|
+| .NET SDK | 8.0.x | Untuk UI app + Helper Service |
+| Avalonia | 11.x | Sudah ada di project UI |
 | JetBrains Rider | 2024.x | Atau Visual Studio 2022 17.8+ |
-| Git | 2.40+ | |
 
-### 3.3.2 NuGet packages baru
+### 3.4.2 Project structure baru
 
-Tambahkan ke `HermesNetwork/HermesNetwork.csproj`:
+Tambah project baru `HermesHelperSvc` di solution:
+
+```
+HermesNetwork360-Avalonia.sln
+├── HermesNetwork/                        ← UI app (existing)
+├── HermesUpdater/                         ← existing
+└── HermesHelperSvc/                       ← BARU
+    ├── HermesHelperSvc.csproj
+    └── ...
+```
+
+`HermesHelperSvc.csproj` minimal:
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>HermesHelperSvc</RootNamespace>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="8.0.0" />
+    <PackageReference Include="System.IO.Pipes.AccessControl" Version="5.0.0" />
+  </ItemGroup>
+</Project>
+```
+
+### 3.4.3 NuGet untuk UI app
+
+Tambah ke `HermesNetwork/HermesNetwork.csproj`:
 
 ```xml
 <ItemGroup>
-  <!-- Layer 2: HTTP client utilities -->
   <PackageReference Include="System.Net.Http.Json" Version="8.0.0" />
-  <PackageReference Include="Microsoft.Extensions.Http.Polly" Version="8.0.0" />
-
-  <!-- Logging -->
   <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
+  <!-- Untuk Supabase (kalau belum ada) -->
+  <PackageReference Include="supabase-csharp" Version="0.16.2" />
 </ItemGroup>
 ```
 
-> **Tidak butuh NuGet** untuk crypto Curve25519 — kita generate keypair via `wg genkey` (CLI WireGuard) yang sudah terbundle dengan installer-nya.
+> Crypto, ECDH, AES-GCM, named-pipe semuanya stdlib — tidak perlu NuGet tambahan.
 
-### 3.3.3 Tooling backend
+## 3.5 Akses & kredensial
 
-| Tool | Versi minimum | Catatan |
+- [ ] Repo `Hermes-Network-Inc/HermesNetwork360Guard` (write access)
+- [ ] Supabase self-hosted admin (untuk migration `user_data` schema kalau perlu)
+- [ ] Mesin Mac dengan Apple Developer ID (untuk signing Helper LaunchDaemon)
+- [ ] User test di Supabase yang sudah punya `user_data.wg_config` ter-populate
+
+## 3.6 Environment variables
+
+### 3.6.1 UI app (saat startup)
+
+| Variable | Contoh | Catatan |
 |---|---|---|
-| Supabase CLI | 1.150+ | `npm i -g supabase` |
-| Deno | 1.40+ | Otomatis terinstall via Supabase CLI |
+| `HNGUARD_SUPABASE_URL` | `https://supabase.hermesnetwork.cloud` | self-hosted URL |
+| `HNGUARD_SUPABASE_ANON_KEY` | `eyJ...` | anon key, dilindungi RLS |
+| `HNGUARD_SASE_TUNNEL_NAME` | `Hermes` | nama tunnel di OS service |
+
+### 3.6.2 Helper Service
+
+Helper Service **tidak** butuh env var network/Supabase — dia stateless dan hanya terima request dari UI lokal.
+
+## 3.7 Verifikasi cepat
+
+### 3.7.1 Test PostgREST + RLS
 
 ```bash
-supabase login
-supabase link --project-ref YOUR_PROJECT_REF
+# Login user test
+JWT=$(curl -X POST "$SUPABASE_URL/auth/v1/token?grant_type=password" \
+  -H "apikey: $ANON" -H "Content-Type: application/json" \
+  -d '{"email":"test@hermes","password":"..."}' | jq -r .access_token)
+
+# Read user_data — RLS filter otomatis ke row user
+curl "$SUPABASE_URL/rest/v1/user_data?select=id,wg_config" \
+  -H "apikey: $ANON" -H "Authorization: Bearer $JWT" | jq
+# Expected: 1 row (cuma row user yang login)
 ```
 
-## 3.4 Akses & kredensial
+### 3.7.2 Test WireGuard manual
 
-- [ ] Repo `Hermes-Network-Inc/HermesNetwork360Guard` di GitHub (write access)
-- [ ] Supabase project (admin role untuk deploy edge function)
-- [ ] Akun admin SASE control plane (untuk generate API key + cek peer state)
-- [ ] SSH ke gateway (untuk debug peer registration kalau ada masalah)
-
-## 3.5 Environment variables
-
-### 3.5.1 Desktop client (di-set saat startup app)
-
-| Variable | Contoh | Asal |
-|---|---|---|
-| `HNGUARD_SUPABASE_URL` | `https://xxx.supabase.co` | Supabase dashboard |
-| `HNGUARD_SUPABASE_ANON_KEY` | `eyJ...` | Supabase dashboard |
-| `HNGUARD_SASE_TUNNEL_NAME` | `Hermes` | Statis, sama dengan label di OS service |
-
-### 3.5.2 Supabase Edge Function (set via `supabase secrets`)
-
-| Variable | Contoh | Asal |
-|---|---|---|
-| `SASE_API_URL` | `https://api.sase-control.example.com` | Vendor-specific |
-| `SASE_API_KEY` | `your-api-key-here` | step 3.1.1 |
-| `SASE_GATEWAY_ENDPOINT` | `n1.ndr24.com:51820` | Static |
-| `SASE_GATEWAY_PUBLIC_KEY` | `b64-public-key=` | Public key WireGuard gateway |
-| `SASE_DEFAULT_DNS` | `10.0.0.1, 1.1.1.1` | DNS yang dipush ke client |
+Pakai config dari `user_data.wg_config` user test:
 
 ```bash
-supabase secrets set SASE_API_URL=https://api.sase-control.example.com
-supabase secrets set SASE_API_KEY=your-api-key-here
-supabase secrets set SASE_GATEWAY_ENDPOINT=n1.ndr24.com:51820
-supabase secrets set SASE_GATEWAY_PUBLIC_KEY=b64-public-key=
-supabase secrets set SASE_DEFAULT_DNS=10.0.0.1,1.1.1.1
-```
-
-## 3.6 Verifikasi cepat
-
-### 3.6.1 Test WireGuard installed di endpoint
-
-**Windows:**
-```powershell
-& "C:\Program Files\WireGuard\wg.exe" --version
-# Output: wireguard-tools v1.0.20210914 - https://git.zx2c4.com/wireguard-tools/
-```
-
-**macOS:**
-```bash
-wg --version
-wg-quick --help | head -5
-```
-
-### 3.6.2 Test handshake manual ke gateway
-
-Generate keypair throwaway, register manual via control plane, run sekali, lalu cleanup:
-
-**Windows / macOS / Linux (sama):**
-```bash
-# Generate key
-wg genkey | tee /tmp/priv.key | wg pubkey > /tmp/pub.key
-echo "Public key: $(cat /tmp/pub.key)"
-
-# Buat config minimal (manual register peer di gateway dashboard dulu)
-cat > /tmp/test.conf <<EOF
-[Interface]
-PrivateKey = $(cat /tmp/priv.key)
-Address = 10.99.99.99/32
-
-[Peer]
-PublicKey = <gateway-public-key>
-Endpoint = n1.ndr24.com:51820
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
-EOF
+# Save config ke /tmp
+echo "$WG_CONFIG" > /tmp/test.conf
 
 # Bring up
 sudo wg-quick up /tmp/test.conf
 
-# Test
+# Verify
 wg show
-ping -c 3 10.0.0.1
+ping <internal-IP-yang-ada-di-AllowedIPs>
 
-# Bring down + cleanup
+# Tear down
 sudo wg-quick down /tmp/test.conf
-rm /tmp/test.conf /tmp/priv.key /tmp/pub.key
+rm /tmp/test.conf
 ```
 
-Kalau handshake berhasil, infrastruktur SASE sudah siap dipakai untuk implementasi automation.
+### 3.7.3 Test build Helper Service skeleton
 
-### 3.6.3 Test deploy stub edge function
-
-```bash
-cd <your-supabase-project>
-supabase functions new sase-config
-supabase functions deploy sase-config
+```powershell
+cd HermesHelperSvc
+dotnet build
+# Expected: Build sukses
 ```
 
-Verifikasi muncul di Supabase dashboard → Functions.
+## 3.8 Checklist sebelum lanjut
 
-## 3.7 Checklist sebelum lanjut
-
-Pastikan semua centang sebelum lanjut ke [Bab 4]({{ site.baseurl }}{% link docs/04-tunnel-supervisor.md %}):
-
-- [ ] SASE API key sudah dibuat & disimpan di password manager
-- [ ] Mapping role → AllowedIPs sudah disetujui ops
+- [ ] Supabase self-hosted reachable, PostgREST + RLS aktif
+- [ ] `user_data.wg_config` ter-populate untuk user test
 - [ ] WireGuard installed di mesin development (Win + Mac)
-- [ ] Manual handshake test ke gateway berhasil
-- [ ] Supabase CLI bisa login + link
-- [ ] Edge function stub berhasil di-deploy
-- [ ] Public key gateway WireGuard sudah dicatat
+- [ ] Manual `wg-quick up` dengan config user test berhasil handshake
+- [ ] Project `HermesHelperSvc` ter-create dan build
+- [ ] Apple Developer ID siap (untuk Mac signing)
 
 ---
 
 [← Bab 2 Arsitektur]({{ site.baseurl }}{% link docs/02-arsitektur.md %}){: .btn }
-[Bab 4 — TunnelSupervisor →]({{ site.baseurl }}{% link docs/04-tunnel-supervisor.md %}){: .btn .btn-primary }
+[Bab 4 — Helper Service →]({{ site.baseurl }}{% link docs/04-tunnel-supervisor.md %}){: .btn .btn-primary }
