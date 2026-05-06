@@ -73,7 +73,7 @@ flowchart TB
     end
 
     SB[(Supabase user_data<br/>RLS-protected)]
-    WGS_W[wireguard.exe<br/>+ Tunnel Service]
+    WGS_W[tunnel.dll embedded<br/>+ WireGuardTunnel$Hermes Service]
     WGS_M[wg-quick<br/>+ LaunchDaemon]
     GW[(WireGuard Gateway<br/>per-user endpoint)]
 
@@ -121,7 +121,7 @@ Run di context user biasa. Tidak punya privilege admin.
 **Yang TIDAK dilakukan:**
 - Tidak install/start/stop Windows service
 - Tidak write config ke `C:\Program Files\WireGuard\Data\`
-- Tidak shell out ke `wireguard.exe`/`wg-quick`
+- Tidak akses native binding WireGuard (`tunnel.dll` / `wireguard-go`) langsung — itu domain Helper
 - Tidak pegang API key SASE / token privileged
 
 ### Komponen B — Hermes Helper Service (SYSTEM/root)
@@ -171,7 +171,7 @@ HermesHelperSvc/                           ← project terpisah dari HermesNetwo
 │       └── TunnelStatusHandler.cs
 ├── Os/
 │   ├── IOsBackend.cs
-│   ├── WindowsBackend.cs                  ← wireguard.exe / sc.exe / ServiceController
+│   ├── WindowsBackend.cs                  ← TunnelDll P/Invoke (embedded tunnel.dll/wireguard.dll) + ServiceController
 │   └── MacBackend.cs                      ← wg-quick / launchctl
 └── Auth/
     └── CallerAuthenticator.cs             ← validate same-user / same-machine
@@ -321,7 +321,7 @@ Hash compare di client menghindari unnecessary tunnel restart. Polling 5 menit c
 
 ## 2.8 Apa yang TIDAK berubah
 
-- ✅ WireGuard data plane: binary `wireguard.exe` / `wg-quick` resmi
+- ✅ WireGuard data plane: **embedded** `tunnel.dll` + `wireguard.dll` (Windows, lewat `HermesNetwork/TunnelDll/` P/Invoke) dan **bundled** `wireguard-go` di app bundle (macOS, di `Contents/MacOS/{arm,intel}/wireguard-go`). Tidak ada bundle WireGuard official installer terpisah.
 - ✅ Crypto WireGuard
 - ✅ **Supabase `user_data` schema** — semua 23 kolom existing tetap apa adanya. **Tidak ada migration.** Tidak ada kolom baru. Tidak ada trigger baru. Tidak ada policy baru. RLS yang sudah aktif (`uid() = uid`) cukup.
 - ✅ Tab UI Avalonia struktur

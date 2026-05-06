@@ -181,13 +181,13 @@ INSERT INTO user_data (id) VALUES ('<user-uuid>') ON CONFLICT DO NOTHING;
 
 ## 11.9 Helper RPC error -32002 (OS operation failed)
 
-**Penyebab:** Command OS gagal — `wireguard.exe` exit non-zero, `wg-quick` error, `sc` access denied, dll.
+**Penyebab:** Operasi OS gagal — `Service.Add` / `Service.Remove` (embedded TunnelDll) throw, `wg-quick` (Mac) error, `sc` access denied, dll.
 
 **Diagnosa:** Lihat `error.data` di response — biasanya forward stderr dari command yang gagal.
 
 **Fix tergantung error message:**
 - "Access denied" → Helper tidak running as SYSTEM/root → reinstall service
-- "File not found: wireguard.exe" → WG belum installed
+- "DLL not found: tunnel.dll" → `tunnel.dll` (Windows) atau `wireguard-go` (Mac, di `Contents/MacOS/{arch}/`) tidak ter-deploy benar; rebuild + reinstall app. WG **embedded di project**, bukan external installer.
 - "Service already exists" → uninstall existing tunnel dulu sebelum install ulang
 
 ## 11.10 Performance: tunnel bandwidth rendah

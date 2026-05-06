@@ -464,38 +464,64 @@ public sealed record TunnelStatus(
 
 #### `WindowsBackend.cs`
 
-Pakai `wireguard.exe` untuk install/uninstall tunnel service, `ServiceController` untuk start/stop, `wg.exe show <name> dump` untuk status.
+Implementasi Windows mengikuti **pattern existing** di Hermes Guard yang memakai **embedded WireGuard via `tunnel.dll` + `wireguard.dll`** P/Invoke (lihat folder `HermesNetwork/TunnelDll/`). **Tidak ada call ke `wireguard.exe` external, tidak ada path `C:\Program Files\WireGuard\`.**
+
+Helper Service mengkonsumsi tipe & helper yang sudah ada di `HermesNetwork.TunnelDll` (di-share via project reference, atau di-copy ke project Helper):
+
+| Existing tipe | Pakai untuk |
+|---|---|
+| `Service.Add(configFile, ephemeral)` | InstallTunnel — register Windows Service `WireGuardTunnel$<name>` dengan binPath ke binary self (HermesHelperSvc / HermesNetwork360Guard) plus argumen `/service <conf> <pid>`. Internal call `Win32.OpenSCManager` + `CreateService`. |
+| `Service.Remove(tunnelName)` | UninstallTunnel — `ControlService` STOP + `DeleteService` |
+| `Service.Run(configFile)` | Tunnel runtime — call `WireGuardTunnelService(configFile)` di `tunnel.dll` (di-call hanya saat binary jalan dengan `/service` flag, bukan dari Helper directly) |
+| `Driver.Adapter(...)` | Adapter handle untuk query status (dari `wireguard.dll`: `WireGuardOpenAdapter`, `WireGuardGetConfiguration`, dst.) |
 
 ```csharp
+using HermesNetwork.TunnelDll;     // existing project reference
+
 [SupportedOSPlatform("windows")]
 public sealed class WindowsBackend : IOsBackend
 {
-    private const string WgDir = @"C:\Program Files\WireGuard";
-    private static string WireguardExe => Path.Combine(WgDir, "wireguard.exe");
-    private static string WgExe        => Path.Combine(WgDir, "wg.exe");
+    // Hermes Guard memakai folder data sendiri, BUKAN C:\Program Files\WireGuard\
+    private static string ConfDir => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "HermesNetwork360Guard", "Sase");
+
+    private static string ConfPath(string name) => Path.Combine(ConfDir, $"{name}.conf");
 
     public async Task InstallTunnelAsync(string name, string config, CancellationToken ct)
     {
-        var tmpPath = Path.Combine(Path.GetTempPath(), $"hermes-{name}-{Guid.NewGuid():N}.conf");
-        await File.WriteAllTextAsync(tmpPath, config, ct);
-        try
-        {
-            await RunAsync(WireguardExe, $"/installtunnelservice \"{tmpPath}\"", ct);
-        }
-        finally
-        {
-            try { File.Delete(tmpPath); } catch { }
-        }
+        Directory.CreateDirectory(ConfDir);
+        var conf = ConfPath(name);
+        await File.WriteAllTextAsync(conf, config, ct);
+
+        // Existing helper di TunnelDll/Service.cs — register Windows Service
+        // WireGuardTunnel$<name> dengan binPath = current process exe + "/service <conf> <pid>"
+        await Task.Run(() => Service.Add(conf, ephemeral: false), ct);
     }
 
     public async Task UninstallTunnelAsync(string name, CancellationToken ct)
-        => await RunAsync(WireguardExe, $"/uninstalltunnelservice {name}", ct);
+    {
+        await Task.Run(() => Service.Remove(name), ct);    // existing wrapper — call DeleteService
+        try { File.Delete(ConfPath(name)); } catch { }
+    }
 
     public async Task ApplyConfigAsync(string name, string config, CancellationToken ct)
     {
-        // Cara paling simple: uninstall + re-install dengan config baru
-        try { await UninstallTunnelAsync(name, ct); } catch { /* mungkin belum install */ }
-        await InstallTunnelAsync(name, config, ct);
+        // Replace config file + restart service
+        await File.WriteAllTextAsync(ConfPath(name), config, ct);
+
+        var st = await GetStatusAsync(name, ct);
+        if (st.State == "NotInstalled")
+        {
+            await Task.Run(() => Service.Add(ConfPath(name), ephemeral: false), ct);
+        }
+        else
+        {
+            // Reload via uninstall + reinstall (paling simpel; reload tunnel runtime
+            // butuh ipc UAPI pipe ke WireGuardTunnel$<name> — bisa di-extend nanti)
+            await UninstallTunnelAsync(name, ct);
+            await Task.Run(() => Service.Add(ConfPath(name), ephemeral: false), ct);
+        }
     }
 
     public async Task StartTunnelAsync(string name, CancellationToken ct)
@@ -514,7 +540,7 @@ public sealed class WindowsBackend : IOsBackend
         await WaitForStatusAsync(sc, ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30), ct);
     }
 
-    public async Task<TunnelStatus> GetStatusAsync(string name, CancellationToken ct)
+    public Task<TunnelStatus> GetStatusAsync(string name, CancellationToken ct)
     {
         var serviceName = $"WireGuardTunnel${name}";
         string state;
@@ -532,18 +558,53 @@ public sealed class WindowsBackend : IOsBackend
         }
         catch (InvalidOperationException)
         {
-            return new TunnelStatus(name, "NotInstalled", null, 0, 0, 0, null);
+            return Task.FromResult(new TunnelStatus(name, "NotInstalled", null, 0, 0, 0, null));
         }
 
         if (state != "Up")
-            return new TunnelStatus(name, state, null, 0, 0, 0, null);
+            return Task.FromResult(new TunnelStatus(name, state, null, 0, 0, 0, null));
 
-        return await ParseWgShowAsync(name, ct) with { Name = name, State = state };
+        // Query stats via Driver.Adapter (wireguard.dll) — existing pattern
+        return Task.FromResult(QueryViaDriver(name, state));
     }
+
+    private static TunnelStatus QueryViaDriver(string name, string state)
+    {
+        try
+        {
+            using var adapter = new Driver.Adapter(name);
+            // Parse adapter.GetConfiguration() → byte[] WG_INTERFACE struct + WG_PEER[]
+            // Existing helper di Driver.cs sudah expose method-method ini.
+            // Hitung bytesRx/Tx/lastHandshake dari struct.
+            // (kode parsing UAPI WireGuard sudah ada di TunnelDll/Driver.cs sebagai pattern)
+            return new TunnelStatus(name, state,
+                LastHandshake: null /* parsed dari config */,
+                BytesReceived: 0, BytesSent: 0, PeerCount: 0,
+                InterfaceAddress: null);
+        }
+        catch
+        {
+            return new TunnelStatus(name, "Faulted", null, 0, 0, 0, null);
+        }
+    }
+
+    // (versi alternatif yang lebih simple kalau tidak butuh stats real-time:
+    //  passthrough TunnelStatus dengan state saja, tanpa parse adapter config —
+    //  cukup untuk UX awal "Connected vs Disconnected"; bisa di-extend setelahnya.)
 
     private async Task<TunnelStatus> ParseWgShowAsync(string name, CancellationToken ct)
     {
-        var (code, stdout, _) = await RunWithOutputAsync(WgExe, $"show {name} dump", ct);
+        // [DEPRECATED kalau pakai Driver.Adapter di atas. Tinggal kalau memang
+        //  butuh fallback ke wg.exe — yang TIDAK ada di Hermes Guard installation.]
+        // Method ini disimpan sebagai referensi; jangan dipakai di production.
+        await Task.CompletedTask;
+        return new TunnelStatus(name, "Faulted", null, 0, 0, 0, null);
+    }
+
+    private async Task<TunnelStatus> ParseWgShowAsyncOriginal(string name, CancellationToken ct)
+    {
+        // Original implementation kept for reference (REMOVED FROM PRODUCTION)
+        var (code, stdout, _) = (-1, "", "");
         if (code != 0)
             return new TunnelStatus(name, "Faulted", null, 0, 0, 0, null);
 

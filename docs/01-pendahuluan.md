@@ -53,7 +53,7 @@ Berdasarkan audit kode (`HermesNetwork/Service/IpcComService.cs`, `ConfigViewMod
 
 Komponen yang ada:
 
-1. **WireGuard tunnel service** — Windows service yang dikelola oleh `wireguard.exe /installtunnelservice`
+1. **WireGuard tunnel service** — Windows service `WireGuardTunnel$<name>` yang di-host oleh binary Hermes sendiri (lewat embedded `tunnel.dll` P/Invoke; bukan `wireguard.exe` external)
 2. **`ServiceEngine.exe`** — Windows Service custom (jalan as SYSTEM) yang manage operasi privileged seperti install/start/stop WireGuard
 3. **Custom IPC** — UI Avalonia → ServiceEngine via named-pipe JSON ad-hoc dengan magic strings (`Code: "Z1398V"`, dst.)
 4. **`ConfigViewModel`** — handle button SASE, query state via `sc.exe`
@@ -94,7 +94,7 @@ UI berkomunikasi dengan ServiceEngine lewat named-pipe JSON dengan magic strings
 
 | Operasi | Butuh admin? |
 |---|---|
-| `wireguard.exe /installtunnelservice` | ✅ Ya (install Windows Service baru) |
+| Register Windows Service `WireGuardTunnel$<name>` (via `Service.Add()` → `Win32.OpenSCManager` + `CreateService`, embedded di `TunnelDll/`) | ✅ Ya (install service baru) |
 | Write config ke `C:\Program Files\WireGuard\Data\Configurations\` | ✅ Ya |
 | `sc start WireGuardTunnel$Hermes` | ✅ Ya (dengan SCM access) |
 | `wg show` (read status) | ❌ Tidak (di Mac); ya sebagian (di Win, butuh akses pipe) |

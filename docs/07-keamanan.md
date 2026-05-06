@@ -53,7 +53,8 @@ permalink: /docs/keamanan/
 │               │
 │               ▼
 │  ┌─────────────────────────┐
-│  │ wireguard.exe / wg-quick │  <── OS service / kernel
+│  │ tunnel.dll embedded (Win) /  │  <── OS service / kernel
+│  │ wireguard-go bundled (Mac)   │
 │  └─────────────────────────┘
 └─────────────────────────────────────────────────────────────────┘
 ```

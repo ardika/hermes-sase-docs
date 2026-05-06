@@ -49,7 +49,7 @@ Hasil akhir: SASE yang **roaming-aware**, **fully auditable**, dengan **trust bo
 - Pemrograman C# / .NET 8 (Avalonia)
 - Konsep dasar VPN, routing, NAT
 - Konsep dasar WireGuard (peer, public/private key, AllowedIPs)
-- Operasi `wg`, `wg-quick`, `wireguard.exe` pada level dasar
+- Konsep dasar tunnel WireGuard (config, peer, handshake) — implementasi pakai **embedded** `tunnel.dll` (Windows) + `wireguard-go` bundled (macOS), bukan client official external
 
 ---
 
@@ -65,7 +65,7 @@ Hasil akhir: SASE yang **roaming-aware**, **fully auditable**, dengan **trust bo
 | 6 | [Layer 3 — Connection Flow]({{ site.baseurl }}{% link docs/06-connection-flow.md %}) | Bring-up, monitor, roaming, refresh |
 | 7 | [Keamanan & Threat Model]({{ site.baseurl }}{% link docs/07-keamanan.md %}) | PSK, key rotation, identity-aware |
 | 8 | [Dukungan macOS]({{ site.baseurl }}{% link docs/08-mac-support.md %}) | wg-quick, LaunchDaemon, signing |
-| 9 | [WireGuard CLI Reference]({{ site.baseurl }}{% link docs/09-cli-reference.md %}) | Cheat-sheet `wg`, `wg-quick`, `wireguard.exe` |
+| 9 | [WireGuard CLI Reference]({{ site.baseurl }}{% link docs/09-cli-reference.md %}) | Cheat-sheet `wg`, `wg-quick` (untuk debug — production pakai embedded `tunnel.dll`) |
 | 10 | [Rencana Migrasi]({{ site.baseurl }}{% link docs/10-migrasi.md %}) | Phase 0–6, rollback |
 | 11 | [Troubleshooting]({{ site.baseurl }}{% link docs/11-troubleshooting.md %}) | Error umum + debugging |
 | 12 | [FAQ]({{ site.baseurl }}{% link docs/12-faq.md %}) | Pertanyaan & keputusan desain |

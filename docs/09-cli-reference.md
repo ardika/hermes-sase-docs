@@ -166,7 +166,9 @@ sudo wg showconf Hermes > Hermes.snapshot.conf
 
 Berguna untuk debug; output **mengandung private key dan PSK**, simpan dengan permission ketat.
 
-## 9.3 `wireguard.exe` (Windows)
+## 9.3 `wireguard.exe` (Windows) — REFERENCE SAJA, TIDAK DIPAKAI
+
+> **PENTING:** Hermes Guard memakai **embedded `tunnel.dll`** (lihat `HermesNetwork/TunnelDll/`), **bukan** `wireguard.exe` external. Section ini disimpan sebagai referensi umum untuk troubleshooting manual saat developer ingin reproduksi behavior pakai WireGuard official client di mesin dev. Production code TIDAK panggil `wireguard.exe`.
 
 Satu-satunya tool resmi untuk install/manage tunnel service di Windows.
 
@@ -340,9 +342,9 @@ sudo wg-quick up Hermes
 | Operasi | Windows | macOS |
 |---|---|---|
 | Generate priv key | `wg genkey` | `wg genkey` |
-| Bring tunnel up | `wireguard.exe /installtunnelservice <conf>` + `sc start ...` | `wg-quick up <name>` |
+| Bring tunnel up | `Service.Add(conf, false)` (embedded TunnelDll) + `sc start ...` | `wg-quick up <name>` (binary bundled di app bundle) |
 | Bring tunnel down | `sc stop "WireGuardTunnel$Name"` | `wg-quick down <name>` |
-| Uninstall tunnel | `wireguard.exe /uninstalltunnelservice <name>` | `rm /etc/wireguard/<name>.conf` |
+| Uninstall tunnel | `Service.Remove(name)` (embedded TunnelDll → `DeleteService` SCM API) | `rm /etc/wireguard/<name>.conf` + bootout LaunchDaemon |
 | Show status | `wg show` (cmd) | `wg show` |
 | Check service | `sc query "WireGuardTunnel$Name"` | `launchctl list <label>` |
 | Logs | Event Viewer | `tail /var/log/sase-tunnel.*.log` |

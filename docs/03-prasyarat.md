@@ -78,35 +78,65 @@ WITH CHECK (uid() = uid)
 | `MTU`, `PersistentKeepalive` di config | ❌ TIDAK ada di config production. |
 | Realtime subscription | ❌ Tidak aktif. Pakai polling. |
 
-## 3.3 WireGuard di endpoint
+## 3.3 WireGuard — Embedded, BUKAN Bundle Installer
 
-### 3.3.1 Windows
+> **PENTING:** Hermes Network 360 Guard menggunakan **WireGuard yang sudah embedded di dalam project**, bukan menginstall WireGuard official client di endpoint user. Implementasi yang sudah berjalan ini **tetap dipertahankan** dalam refactor.
 
-WireGuard for Windows resmi: [wireguard.com/install](https://www.wireguard.com/install/). Yang dipakai:
+### 3.3.1 Windows — `tunnel.dll` via P/Invoke
 
-| File | Lokasi default |
+WireGuard tunnel service di Windows di-load lewat P/Invoke ke `tunnel.dll` yang sudah di-bundle di root project Hermes Guard. Implementasi existing ada di folder `HermesNetwork/TunnelDll/`:
+
+| File | Fungsi |
 |---|---|
-| `wireguard.exe` | `C:\Program Files\WireGuard\` |
-| `wg.exe` | `C:\Program Files\WireGuard\` |
-| Tunnel service | `WireGuardTunnel$<TunnelName>` |
-| Config | `C:\Program Files\WireGuard\Data\Configurations\<TunnelName>.conf.dpapi.aes` |
+| `HermesNetwork/TunnelDll/Driver.cs` | P/Invoke ke `wireguard.dll` (`WireGuardCreateAdapter`, `WireGuardOpenAdapter`, `WireGuardGetConfiguration`, dst.) untuk adapter management |
+| `HermesNetwork/TunnelDll/Service.cs` | P/Invoke ke `tunnel.dll` (`WireGuardTunnelService`) untuk tunnel runtime; plus `Service.Add(configFile, ephemeral)` yang register Windows Service |
+| `HermesNetwork/TunnelDll/Win32.cs` | Wrapper SCM API (`OpenSCManager`, `CreateService`, dst.) |
+| `HermesNetwork/TunnelDll/RingLogger.cs` | Log internal WireGuard |
+| `tunnel.dll` di root project (~12 MB) | Embedded WireGuard tunnel binary |
 
-Bundle WireGuard installer di `.msi` Hermes 360 Guard atau download saat first run.
+**Pattern existing yang tetap dipakai:**
+- Tidak ada `wireguard.exe` external. Tidak ada `C:\Program Files\WireGuard\`.
+- Service Windows yang di-register adalah `WireGuardTunnel$<TunnelName>` dengan `binPath` mengarah ke binary Hermes (`HermesHelperSvc.exe` atau `HermesNetwork360Guard.exe`) plus argumen `/service <config>` — binary tersebut self-host tunnel via `Service.Run(configFile)` yang call `WireGuardTunnelService(configFile)` di `tunnel.dll`.
+- Lifecycle service via `Win32.OpenSCManager` + `CreateService` / `StartService` / `ControlService` / `DeleteService` — sudah ada di `Service.cs`.
 
-### 3.3.2 macOS
+> Refactor SASE **tidak menyentuh native binding**. Helper Service hanya wrap pattern existing dengan kontrak JSON-RPC yang lebih bersih.
 
-Pakai `wireguard-go + wg-quick` (bukan WireGuard.app dari App Store):
+### 3.3.2 macOS — `wireguard-go` Bundled di App Bundle
 
-```bash
-# Install (dev): Homebrew, atau bundle di .pkg Hermes (prod)
-brew install wireguard-tools
+Binary `wireguard-go` di-bundle di `.app` Hermes Guard:
 
-# Verifikasi
-which wg-quick     # /usr/local/bin/wg-quick
-wg --version
+```
+HermesNetwork360Guard.app/
+└── Contents/
+    └── MacOS/
+        ├── arm/wireguard-go        ← ARM64 (M1/M2/M3)
+        └── intel/wireguard-go      ← x86_64 (Mac Intel)
 ```
 
-Detail signing + bundle binary di [Bab 8 — macOS]({{ site.baseurl }}{% link docs/08-mac-support.md %}).
+Pattern existing (lihat `HermesNetwork/ViewModels/ConfigViewModel.cs`):
+
+```csharp
+// Up tunnel — pakai wg-quick yang sudah ada di /usr/local/bin/
+"/usr/local/bin/bash /usr/local/bin/wg-quick up <conf-path>"
+
+// Down tunnel
+"/usr/local/bin/bash /usr/local/bin/wg-quick down <conf-path>"
+
+// Status
+"sudo /usr/local/bin/wg show"
+```
+
+> Refactor mempertahankan pattern ini — Helper Service akan call `wg-quick up/down` yang sama, hanya melalui IPC dari UI bukan langsung dari ViewModel.
+
+### 3.3.3 Yang Berubah & Tidak Berubah
+
+| Aspek | Sebelum (saat ini) | Setelah refactor |
+|---|---|---|
+| WireGuard di Windows | `tunnel.dll` P/Invoke embedded | **Sama** — `tunnel.dll` P/Invoke embedded |
+| WireGuard di macOS | `wireguard-go` bundled di `.app` + `wg-quick` system | **Sama** — bundled binary tetap dipakai |
+| Lifecycle tunnel | UI ↔ `IpcComService` ↔ ServiceEngine.exe ↔ TunnelDll | UI ↔ JSON-RPC ↔ HermesHelperSvc ↔ TunnelDll (existing) |
+| Bundle WireGuard external installer | TIDAK (sudah embedded) | **TIDAK** (tetap embedded) |
+| Install WireGuard official client | TIDAK (tidak diperlukan) | **TIDAK** (tetap tidak diperlukan) |
 
 ## 3.4 Hermes Helper Service
 
@@ -125,7 +155,7 @@ Selama install Hermes 360 Guard:
 
 1. Install `HermesNetwork360Guard.exe` ke `C:\Program Files\Hermes Network\` (atau `/Applications/` di Mac)
 2. Install `HermesHelperSvc.exe` di lokasi yang sama
-3. Bundle WireGuard binaries
+3. Pastikan `tunnel.dll` (Windows, di samping binary Hermes) atau `wireguard-go` (Mac, di `Contents/MacOS/{arm,intel}/`) ter-deploy bersama app — sudah di-bundle sebagai bagian dari project Hermes, bukan installer terpisah
 4. Register Helper sebagai service:
 
    **Windows:**

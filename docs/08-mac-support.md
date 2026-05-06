@@ -18,15 +18,16 @@ permalink: /docs/mac-support/
 
 ## 8.1 Komponen di macOS
 
-Tiga komponen yang perlu di-install di Mac:
+Komponen yang ter-distribute via satu `.pkg` installer:
 
 | Komponen | Lokasi | Run as |
 |---|---|---|
 | Hermes UI app | `/Applications/HermesNetwork360Guard.app` | Current user |
 | Hermes Helper Service | `/usr/local/bin/HermesHelperSvc` + LaunchDaemon | `root` |
-| WireGuard binaries | `/usr/local/bin/{wg,wg-quick,wireguard-go}` | (called by Helper) |
+| **WireGuard `wireguard-go` (embedded)** | **`HermesNetwork360Guard.app/Contents/MacOS/{arm,intel}/wireguard-go`** | (called by Helper) |
+| `wg-quick` script | `/usr/local/bin/wg-quick` (di-install oleh installer atau dependency wireguard-tools) | (called by Helper) |
 
-UI dan Helper di-distribute lewat satu `.pkg` installer.
+> **PENTING:** `wireguard-go` **sudah embedded di app bundle Hermes Guard** (sesuai pattern existing — lihat `Hermes360-MacOS-Installer/HermesNetwork/Contents/MacOS/{arm,intel}/wireguard-go`). User TIDAK perlu install WireGuard official client dari `wireguard.com` atau `brew install wireguard-tools`. Refactor mempertahankan embedded approach ini.
 
 ## 8.2 PKG installer struktur
 
@@ -34,11 +35,13 @@ UI dan Helper di-distribute lewat satu `.pkg` installer.
 Hermes-Network-360-Guard.pkg
 └── Payload/
     ├── Applications/HermesNetwork360Guard.app/
+    │   └── Contents/MacOS/
+    │       ├── HermesNetwork360Guard            ← UI binary (universal)
+    │       ├── arm/wireguard-go                 ← BUNDLED ARM64
+    │       └── intel/wireguard-go               ← BUNDLED Intel
     ├── usr/local/bin/
-    │   ├── HermesHelperSvc
-    │   ├── wg
-    │   ├── wg-quick
-    │   └── wireguard-go
+    │   ├── HermesHelperSvc                      ← Helper Service
+    │   └── wg-quick                              ← script wrapper (bundled atau dependency)
     └── Library/LaunchDaemons/
         └── com.hermesnetwork.helper.plist
 ```
@@ -49,11 +52,17 @@ Hermes-Network-360-Guard.pkg
 #!/bin/bash
 set -e
 
-# Permission untuk Helper + WG binaries
+# Permission untuk Helper
 chown root:wheel /usr/local/bin/HermesHelperSvc
 chmod 755 /usr/local/bin/HermesHelperSvc
-chown root:wheel /usr/local/bin/{wg,wg-quick,wireguard-go}
-chmod 755 /usr/local/bin/{wg,wg-quick,wireguard-go}
+
+# Permission untuk wg-quick (kalau di-bundle di /usr/local/bin/)
+[ -f /usr/local/bin/wg-quick ] && chmod 755 /usr/local/bin/wg-quick
+
+# wireguard-go BUNDLED di app bundle, signed sebagai bagian dari .app —
+# tidak perlu copy / chmod terpisah. Helper resolve path lewat
+# /Applications/HermesNetwork360Guard.app/Contents/MacOS/{arm,intel}/wireguard-go
+# berdasarkan arsitektur runtime.
 
 # LaunchDaemon plist
 chown root:wheel /Library/LaunchDaemons/com.hermesnetwork.helper.plist
@@ -167,7 +176,7 @@ codesign --force --options runtime --sign "$SIGN_ID" --timestamp \
   "publish/HermesHelperSvc"
 
 # Sign WG binaries
-for bin in wg wg-quick wireguard-go; do
+for bin in wg-quick; do  # wireguard-go di-sign bersamaan dengan app bundle (di Contents/MacOS/{arm,intel}/)
   codesign --force --options runtime --sign "$SIGN_ID" --timestamp \
     "publish/$bin"
 done

@@ -107,15 +107,20 @@ Default soft-fail; opt-in kill switch per role. Implementasi via firewall rule y
 
 ## 12.2 Pertanyaan implementasi
 
-### **Boleh pakai library .NET WireGuard wrapper bukan shell out?**
+### **Pakai shell-out ke `wireguard.exe` external atau embedded?**
 
-Bisa, tapi:
-- Library wrapper biasanya outdated atau partial coverage
-- Shell out ke `wireguard.exe`/`wg`/`wg-quick` adalah path resmi
-- Output `wg show dump` parse-able dan stable
-- Mengurangi NuGet dependency
+**Tetap pakai embedded WireGuard yang sudah ada di project Hermes Guard**:
 
-Hanya pakai library kalau ada kebutuhan spesifik (mis. embed userspace WireGuard tanpa external CLI).
+- **Windows**: P/Invoke ke `tunnel.dll` (~12 MB, bundled di root project) dan `wireguard.dll` lewat existing wrapper di `HermesNetwork/TunnelDll/` (`Driver.cs`, `Service.cs`, `Win32.cs`). Pattern ini sudah berjalan; refactor SASE hanya menambahkan layer Helper Service di atasnya, bukan mengganti binding.
+- **macOS**: `wireguard-go` (~3.8 MB) bundled di `HermesNetwork360Guard.app/Contents/MacOS/{arm,intel}/`. Plus `wg-quick` script (di-bundle atau dependency wireguard-tools system) dipanggil oleh Helper.
+
+**TIDAK** memakai `wireguard.exe` / `wg.exe` external dari `C:\Program Files\WireGuard\`. **TIDAK** meminta user install WireGuard official client. **TIDAK** bundle WireGuard official installer terpisah di MSI/PKG Hermes.
+
+Alasan tetap embedded:
+- Pattern existing sudah audited & jalan di production
+- Mengurangi dependency external user
+- Tidak butuh elevation tambahan untuk install WireGuard external
+- Distribution lebih simpel — satu installer Hermes Guard sudah include semua
 
 ### **Boleh pakai gRPC untuk IPC UI ↔ Helper?**
 
