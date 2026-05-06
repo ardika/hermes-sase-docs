@@ -16,53 +16,72 @@ permalink: /docs/mac-support/
 
 ---
 
-## 8.1 Dua opsi WireGuard di macOS
+## 8.1 Komponen di macOS
 
-| Opsi | Deskripsi | Cocok untuk |
+Komponen yang ter-distribute via satu `.pkg` installer:
+
+| Komponen | Lokasi | Run as |
 |---|---|---|
-| **WireGuard.app** dari Mac App Store | UI resmi, NetworkExtension, sandboxed | End-user manual install |
-| **wireguard-go + wg-quick** | CLI, jalan sebagai LaunchDaemon | Otomasi enterprise |
+| Hermes UI app | `/Applications/HermesNetwork360Guard.app` | Current user |
+| Hermes Helper Service | `/usr/local/bin/HermesHelperSvc` + LaunchDaemon | `root` |
+| **WireGuard `wireguard-go` (embedded)** | **`HermesNetwork360Guard.app/Contents/MacOS/{arm,intel}/wireguard-go`** | (called by Helper) |
+| `wg-quick` script | `/usr/local/bin/wg-quick` (di-install oleh installer atau dependency wireguard-tools) | (called by Helper) |
 
-Untuk Hermes Network 360 Guard yang butuh full automation, pakai **wireguard-go + wg-quick**.
+> **PENTING:** `wireguard-go` **sudah embedded di app bundle Hermes Guard** (sesuai pattern existing — lihat `Hermes360-MacOS-Installer/HermesNetwork/Contents/MacOS/{arm,intel}/wireguard-go`). User TIDAK perlu install WireGuard official client dari `wireguard.com` atau `brew install wireguard-tools`. Refactor mempertahankan embedded approach ini.
 
-## 8.2 Distribusi WireGuard binaries
-
-Cara paling clean: bundle binary `wg`, `wg-quick`, dan `wireguard-go` ke dalam `.pkg` installer Hermes Guard, dan install ke `/usr/local/bin/`.
+## 8.2 PKG installer struktur
 
 ```
 Hermes-Network-360-Guard.pkg
 └── Payload/
-    ├── Applications/
-    │   └── HermesNetwork360Guard.app/
-    └── usr/local/bin/
-        ├── wg
-        ├── wg-quick
-        └── wireguard-go
+    ├── Applications/HermesNetwork360Guard.app/
+    │   └── Contents/MacOS/
+    │       ├── HermesNetwork360Guard            ← UI binary (universal)
+    │       ├── arm/wireguard-go                 ← BUNDLED ARM64
+    │       └── intel/wireguard-go               ← BUNDLED Intel
+    ├── usr/local/bin/
+    │   ├── HermesHelperSvc                      ← Helper Service
+    │   └── wg-quick                              ← script wrapper (bundled atau dependency)
+    └── Library/LaunchDaemons/
+        └── com.hermesnetwork.helper.plist
 ```
 
-Source binary dari project resmi: [git.zx2c4.com/wireguard-tools](https://git.zx2c4.com/wireguard-tools/) dan [git.zx2c4.com/wireguard-go](https://git.zx2c4.com/wireguard-go/). Build sendiri (recommended) atau ambil dari Homebrew bottle.
+`scripts/postinstall`:
 
 ```bash
-# Build wg + wg-quick
-git clone https://git.zx2c4.com/wireguard-tools
-cd wireguard-tools/src
-make
-sudo make install   # ke /usr/local/bin/
+#!/bin/bash
+set -e
+
+# Permission untuk Helper
+chown root:wheel /usr/local/bin/HermesHelperSvc
+chmod 755 /usr/local/bin/HermesHelperSvc
+
+# Permission untuk wg-quick (kalau di-bundle di /usr/local/bin/)
+[ -f /usr/local/bin/wg-quick ] && chmod 755 /usr/local/bin/wg-quick
+
+# wireguard-go BUNDLED di app bundle, signed sebagai bagian dari .app —
+# tidak perlu copy / chmod terpisah. Helper resolve path lewat
+# /Applications/HermesNetwork360Guard.app/Contents/MacOS/{arm,intel}/wireguard-go
+# berdasarkan arsitektur runtime.
+
+# LaunchDaemon plist
+chown root:wheel /Library/LaunchDaemons/com.hermesnetwork.helper.plist
+chmod 644 /Library/LaunchDaemons/com.hermesnetwork.helper.plist
+
+# Buat directory wireguard
+mkdir -p /etc/wireguard
+chmod 700 /etc/wireguard
+chown root:wheel /etc/wireguard
+
+# Bootstrap Helper LaunchDaemon
+launchctl bootstrap system /Library/LaunchDaemons/com.hermesnetwork.helper.plist
+
+exit 0
 ```
 
-Verifikasi installed:
+## 8.3 LaunchDaemon Hermes Helper
 
-```bash
-which wg            # /usr/local/bin/wg
-which wg-quick      # /usr/local/bin/wg-quick
-wg --version        # wireguard-tools v1.0.20210914
-```
-
-## 8.3 LaunchDaemon untuk SASE tunnel
-
-LaunchDaemon (di `/Library/LaunchDaemons/`) jalan sebagai root, persistent across reboot, dan tidak butuh user login.
-
-`/Library/LaunchDaemons/com.hermesnetwork.sase.plist`:
+`/Library/LaunchDaemons/com.hermesnetwork.helper.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -70,26 +89,24 @@ LaunchDaemon (di `/Library/LaunchDaemons/`) jalan sebagai root, persistent acros
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.hermesnetwork.sase</string>
+    <string>com.hermesnetwork.helper</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/wg-quick</string>
-        <string>up</string>
-        <string>Hermes</string>
+        <string>/usr/local/bin/HermesHelperSvc</string>
     </array>
 
     <key>RunAtLoad</key>
     <true/>
 
     <key>KeepAlive</key>
-    <false/>
+    <true/>
 
     <key>StandardOutPath</key>
-    <string>/var/log/sase-tunnel.out.log</string>
+    <string>/var/log/hermes-helper.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/var/log/sase-tunnel.err.log</string>
+    <string>/var/log/hermes-helper.err.log</string>
 
     <key>UserName</key>
     <string>root</string>
@@ -106,271 +123,190 @@ LaunchDaemon (di `/Library/LaunchDaemons/`) jalan sebagai root, persistent acros
 </plist>
 ```
 
-Permission: `chown root:wheel`, `chmod 644`.
-
-### 8.3.1 Manage via launchctl
+Manage:
 
 ```bash
-# Modern API (macOS 10.10+, recommended)
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.hermesnetwork.sase.plist
-sudo launchctl bootout    system/com.hermesnetwork.sase
+# Lifecycle
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.hermesnetwork.helper.plist
+sudo launchctl bootout    system/com.hermesnetwork.helper
+sudo launchctl kickstart  -k system/com.hermesnetwork.helper
 
-# Force restart
-sudo launchctl kickstart -k system/com.hermesnetwork.sase
-
-# Check status
-sudo launchctl list com.hermesnetwork.sase
+# Status
+sudo launchctl list com.hermesnetwork.helper
 ```
 
-`launchctl kickstart -k system/<label>` adalah cara terbaik untuk apply config baru: stop dulu, baru start ulang dalam satu command.
+## 8.4 LaunchDaemon WireGuard tunnel (per session)
 
-### 8.3.2 Legacy API (kalau butuh kompat)
+Saat Helper apply config, dia create LaunchDaemon kedua untuk tunnel itu sendiri (lihat `MacBackend` di [Bab 4]({{ site.baseurl }}{% link docs/04-tunnel-supervisor.md %}) §4.3.4):
 
-```bash
-sudo launchctl load   /Library/LaunchDaemons/com.hermesnetwork.sase.plist
-sudo launchctl unload /Library/LaunchDaemons/com.hermesnetwork.sase.plist
-sudo launchctl start  com.hermesnetwork.sase
-sudo launchctl stop   com.hermesnetwork.sase
-```
-
-## 8.4 Code signing aplikasi Hermes
-
-Untuk distribusi di luar App Store, butuh **Developer ID Application** + notarization:
-
-### 8.4.1 Apple Developer ID
-
-```bash
-# Verify identity tersedia
-security find-identity -v -p codesigning
-# Output baris: "Developer ID Application: Hermes Network Inc. (XXXXXXXXXX)"
-```
-
-### 8.4.2 Sign binary WireGuard yang dibundle
-
-```bash
-APP_PATH="bin/Release/net8.0/osx-arm64/publish/HermesNetwork360Guard.app"
-SIGN_ID="Developer ID Application: Hermes Network Inc. (XXXXXXXXXX)"
-
-# Sign WireGuard binaries dulu (kalau di-bundle di .app/Contents/MacOS/wg etc.)
-for bin in "$APP_PATH/Contents/MacOS/wg" \
-           "$APP_PATH/Contents/MacOS/wg-quick" \
-           "$APP_PATH/Contents/MacOS/wireguard-go"; do
-  codesign --force --options runtime --sign "$SIGN_ID" --timestamp "$bin"
-done
-
-# Sign all .dylib + .so + executables
-find "$APP_PATH" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +111 \) \
-  -exec codesign --force --options runtime --sign "$SIGN_ID" --timestamp {} \;
-
-# Sign top-level bundle dengan entitlements
-codesign --force --options runtime --sign "$SIGN_ID" --timestamp \
-  --entitlements "Resources/HermesNetwork360Guard.entitlements" \
-  "$APP_PATH"
-
-# Verify
-codesign --verify --deep --strict --verbose=2 "$APP_PATH"
-spctl -a -v "$APP_PATH"
-```
-
-### 8.4.3 Entitlements
-
-`HermesNetwork360Guard.entitlements`:
+`/Library/LaunchDaemons/com.hermesnetwork.sase.Hermes.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>com.apple.security.cs.allow-jit</key>
-    <true/>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <true/>
-    <key>com.apple.security.network.client</key>
-    <true/>
-    <key>com.apple.security.network.server</key>
-    <false/>
-    <key>com.apple.security.files.user-selected.read-write</key>
-    <true/>
-    <!-- Untuk memanggil wg-quick / launchctl via osascript -->
-    <key>com.apple.security.automation.apple-events</key>
-    <true/>
+    <key>Label</key>
+    <string>com.hermesnetwork.sase.Hermes</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/wg-quick</string>
+        <string>up</string>
+        <string>Hermes</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>UserName</key><string>root</string>
 </dict>
 </plist>
 ```
 
-`Info.plist` perlu privacy usage description:
+> Helper sebenarnya tidak harus pakai LaunchDaemon untuk tunnel — bisa langsung `wg-quick up` saat di-request. Pakai LaunchDaemon kalau ingin auto-start saat reboot tanpa harus klik Connect.
+
+## 8.5 Code signing
+
+Sama seperti pattern umum:
+
+```bash
+APP_PATH="bin/Release/net8.0/osx-arm64/publish/HermesNetwork360Guard.app"
+SIGN_ID="Developer ID Application: Hermes Network Inc. (XXXXXXXXXX)"
+
+# Sign Helper binary terlebih dulu
+codesign --force --options runtime --sign "$SIGN_ID" --timestamp \
+  "publish/HermesHelperSvc"
+
+# Sign WG binaries
+for bin in wg-quick; do  # wireguard-go di-sign bersamaan dengan app bundle (di Contents/MacOS/{arm,intel}/)
+  codesign --force --options runtime --sign "$SIGN_ID" --timestamp \
+    "publish/$bin"
+done
+
+# Sign UI app + dylibs
+find "$APP_PATH" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +111 \) \
+  -exec codesign --force --options runtime --sign "$SIGN_ID" --timestamp {} \;
+codesign --force --options runtime --sign "$SIGN_ID" --timestamp \
+  --entitlements "Resources/HermesNetwork360Guard.entitlements" \
+  "$APP_PATH"
+```
+
+Entitlements (`HermesNetwork360Guard.entitlements`):
 
 ```xml
-<key>NSAppleEventsUsageDescription</key>
-<string>Hermes Network 360 Guard butuh elevasi untuk memasang & menjalankan SASE tunnel.</string>
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key><true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+    <key>com.apple.security.network.client</key><true/>
+    <key>com.apple.security.network.server</key><false/>
+    <!-- Tidak butuh apple-events karena tidak osascript -->
+</dict>
+</plist>
 ```
 
-### 8.4.4 Notarization
+> **Penting:** UI tidak perlu `osascript` privilege karena operasi privileged sudah lewat Helper (yang jalan as root via LaunchDaemon dari saat install). Ini lebih clean dan aman.
+
+## 8.6 Notarization
 
 ```bash
-ditto -c -k --keepParent "$APP_PATH" HermesNetwork360Guard.zip
-
-xcrun notarytool submit HermesNetwork360Guard.zip \
-  --keychain-profile AC_PASSWORD \
-  --wait
-
-xcrun stapler staple "$APP_PATH"
-xcrun stapler validate "$APP_PATH"
-```
-
-`AC_PASSWORD` keychain profile setup sekali:
-
-```bash
-xcrun notarytool store-credentials AC_PASSWORD \
-  --apple-id "your-apple-id@hermesnetwork.com" \
-  --team-id "XXXXXXXXXX" \
-  --password "abcd-efgh-ijkl-mnop"
-```
-
-## 8.5 osascript untuk privilege elevation
-
-`MacTunnelSupervisor` di Bab 4 pakai osascript:
-
-```bash
-osascript -e 'do shell script "wg-quick up Hermes" with administrator privileges'
-```
-
-Yang terjadi:
-
-1. macOS munculkan dialog: *"Hermes Network 360 Guard wants to make changes."*
-2. User input password admin
-3. Shell command jalan sebagai root
-4. Dialog cuma muncul **sekali per session app**
-
-**Kekurangan:**
-
-- User experience: dialog muncul setiap kali start aplikasi (session baru). Mitigasi: minimal call ke elevation, batch operation.
-- Tidak ada cara pre-approve di code — selalu user interaction.
-
-**Best practice:** prompt elevation di **awal** flow (saat user klik "Connect SASE pertama kali"), simpan koneksi dalam memory, sehingga sesi berikutnya gabung.
-
-## 8.6 Privacy permissions (TCC)
-
-WireGuard tidak butuh Full Disk Access atau Screen Recording. Tapi mungkin butuh:
-
-| Resource | Kapan butuh |
-|---|---|
-| Network access | Otomatis granted untuk app signed |
-| File access (config /etc/wireguard) | Tidak butuh TCC — pakai sudo via osascript |
-
-User tidak akan lihat dialog TCC selama scope-nya hanya networking.
-
-## 8.7 Mac firewall (Application Firewall)
-
-macOS Application Firewall block listener inbound by default. WireGuard hanya bikin **outbound UDP** ke gateway, jadi tidak ada dialog firewall.
-
-Verifikasi tidak ada listener:
-
-```bash
-sudo lsof -nP -iUDP | grep -i wireguard
-# Output: hanya outbound koneksi
-```
-
-## 8.8 NetworkExtension vs LaunchDaemon
-
-Apple modern recommendation untuk VPN di macOS adalah **NetworkExtension framework** (kernel-mode VPN, lebih efisien). Tapi:
-
-- NetworkExtension butuh **Special Entitlement** dari Apple yang sulit didapat untuk app kustom enterprise
-- WireGuard.app dari App Store pakai NetworkExtension; binary `wireguard-go` adalah userspace fallback yang tetap kerja
-
-Untuk Hermes Network scale, **LaunchDaemon + wireguard-go cukup**. Migrasi ke NetworkExtension = future work kalau butuh:
-
-- Kernel-mode WireGuard (lebih cepat)
-- Always-on VPN profile yang di-enforce MDM
-- Per-app VPN
-
-## 8.9 Build matrix
-
-```bash
-# Universal binary untuk Mac (Intel + ARM)
-dotnet publish -c Release -r osx-arm64 --self-contained -o publish/arm64
-dotnet publish -c Release -r osx-x64   --self-contained -o publish/x64
-
-# Lipo
-lipo -create publish/arm64/HermesNetwork360Guard \
-            publish/x64/HermesNetwork360Guard \
-     -output publish/universal/HermesNetwork360Guard
-
-# Repack ke .app universal
-```
-
-## 8.10 PKG installer
-
-Buat installer `.pkg` yang:
-
-1. Install `HermesNetwork360Guard.app` ke `/Applications/`
-2. Install WireGuard binaries ke `/usr/local/bin/`
-3. (Optional) Install LaunchDaemon plist ke `/Library/LaunchDaemons/` (untuk auto-start tunnel kalau di-config later)
-
-```bash
-# Component pkg
-pkgbuild --root "publish-staging" \
+# PKG complete (UI + Helper + WG bins)
+pkgbuild --root publish-staging \
          --identifier "com.hermesnetwork.guard" \
          --version "8.4.0" \
          --install-location "/" \
-         --scripts "scripts/" \
+         --scripts scripts/ \
          HermesNetwork360Guard.component.pkg
 
-# Sign
 productsign --sign "Developer ID Installer: Hermes Network Inc. (XXXXXXXXXX)" \
             HermesNetwork360Guard.component.pkg \
             HermesNetwork360Guard.pkg
 
-# Notarize + staple
-xcrun notarytool submit HermesNetwork360Guard.pkg --keychain-profile AC_PASSWORD --wait
+xcrun notarytool submit HermesNetwork360Guard.pkg \
+  --keychain-profile AC_PASSWORD --wait
+
 xcrun stapler staple HermesNetwork360Guard.pkg
 ```
 
-`scripts/postinstall`:
+## 8.7 IPC: unix-socket
 
-```bash
-#!/bin/bash
-set -e
+Helper listen di `/var/run/hermes-helper.sock`. Saat startup, Helper:
 
-# Set permission yang benar untuk binary
-chmod 755 /usr/local/bin/wg /usr/local/bin/wg-quick /usr/local/bin/wireguard-go
-chown root:wheel /usr/local/bin/wg /usr/local/bin/wg-quick /usr/local/bin/wireguard-go
+1. Delete socket file existing (kalau ada dari crash sebelumnya)
+2. Bind socket
+3. `chmod 0666` (semua user bisa connect) atau `0660` dengan group khusus
 
-# Buat directory wireguard
-mkdir -p /etc/wireguard
-chmod 700 /etc/wireguard
+```csharp
+// Di MacBackend / JsonRpcServer setup
+File.Delete("/var/run/hermes-helper.sock"); // ignore error
+listener.Bind(new UnixDomainSocketEndPoint("/var/run/hermes-helper.sock"));
+listener.Listen(64);
 
-# Buat log directory
-mkdir -p /var/log
-touch /var/log/sase-tunnel.out.log /var/log/sase-tunnel.err.log
-chmod 644 /var/log/sase-tunnel.*.log
-
-exit 0
+// Set permission supaya UI app (running as user) bisa connect
+File.SetUnixFileMode("/var/run/hermes-helper.sock",
+    UnixFileMode.UserRead | UnixFileMode.UserWrite |
+    UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
+    UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
 ```
 
-## 8.11 Testing checklist macOS
+Authentication caller via `getpeereid` — lihat [Bab 7]({{ site.baseurl }}{% link docs/07-keamanan.md %}) §7.5.2.
 
-- [ ] Build `.app` di mesin Mac (atau CI dengan macOS runner)
-- [ ] Sign + notarize sukses, `spctl -a -v` return "accepted"
-- [ ] Install di Mac bersih (clean VM atau wipe)
-- [ ] Login dengan user non-admin
-- [ ] Klik "Connect SASE" → osascript dialog muncul → user input password admin
-- [ ] WireGuard tunnel up: `wg show Hermes` menunjukkan handshake
-- [ ] Browse `https://example.com` lewat tunnel (cek IP via curl ifconfig.me)
-- [ ] Disconnect WiFi 30s → reconnect → tunnel auto-recover (PersistentKeepalive)
-- [ ] Logout user → login lagi → tunnel masih up (LaunchDaemon, bukan LaunchAgent)
-- [ ] Reboot Mac → tunnel auto-start (`RunAtLoad`)
-- [ ] Uninstall via app → service unloaded, plist dihapus, binary dibiarkan (atau dihapus)
+## 8.8 Privacy permissions (TCC)
 
-## 8.12 Common issues
+Hermes UI tidak butuh:
+- ❌ Full Disk Access
+- ❌ Screen Recording
+- ❌ Accessibility
+
+Hermes UI butuh:
+- ✅ Network access (otomatis granted untuk app signed)
+
+Helper Service jalan as root, jadi tidak terkena TCC. Ini **alasan tambahan** kenapa pisah jadi 2 component:
+- UI = sandbox-friendly, sedikit permission
+- Helper = root-level, di luar TCC scope
+
+## 8.9 Build matrix
+
+Universal binary (Intel + ARM) untuk Mac:
+
+```bash
+# UI
+dotnet publish -r osx-arm64 --self-contained -c Release -o publish/ui-arm64
+dotnet publish -r osx-x64   --self-contained -c Release -o publish/ui-x64
+lipo -create publish/ui-arm64/HermesNetwork360Guard \
+            publish/ui-x64/HermesNetwork360Guard \
+     -output publish/universal/HermesNetwork360Guard
+
+# Helper
+dotnet publish -p:HermesHelperSvc -r osx-arm64 --self-contained -c Release -o publish/helper-arm64
+dotnet publish -p:HermesHelperSvc -r osx-x64   --self-contained -c Release -o publish/helper-x64
+lipo -create publish/helper-arm64/HermesHelperSvc \
+            publish/helper-x64/HermesHelperSvc \
+     -output publish/universal/HermesHelperSvc
+```
+
+## 8.10 Testing checklist macOS
+
+- [ ] Build `.pkg` di mesin Mac
+- [ ] Install di Mac bersih, non-admin user
+- [ ] Verify Helper running: `sudo launchctl list com.hermesnetwork.helper`
+- [ ] Verify socket: `ls -la /var/run/hermes-helper.sock`
+- [ ] Login user test di UI → klik Connect SASE
+- [ ] Verify tunnel up: `wg show`
+- [ ] Verify gateway IP: `curl ifconfig.me`
+- [ ] Disable WiFi 30s → reconnect → tunnel auto-recover
+- [ ] Reboot Mac → Helper auto-start, tunnel auto-up (kalau RunAtLoad di plist tunnel)
+- [ ] Uninstall via app → Helper unloaded, plist dihapus
+
+## 8.11 Common issues
 
 | Issue | Cause | Fix |
 |---|---|---|
-| `wg-quick: command not found` | Binary tidak terinstall / PATH | Verify `/usr/local/bin/wg-quick` exists, set `PATH` di plist |
-| `Operation not permitted` saat start tunnel | LaunchDaemon tidak punya privilege | Pastikan plist owner `root:wheel`, mode 644 |
-| Tunnel up tapi tidak ada handshake | Firewall block UDP 51820 | Test `nc -uvz n1.ndr24.com 51820` dari Mac |
-| App freeze saat osascript | Code sign tidak valid | Verify `codesign --verify --deep` |
-| Notarization gagal "hardened runtime missing" | Lupa flag `--options runtime` | Re-sign dengan flag |
+| `launchctl list com.hermesnetwork.helper` exit 113 | Helper belum bootstrap | `sudo launchctl bootstrap system /Library/LaunchDaemons/com.hermesnetwork.helper.plist` |
+| `Permission denied` saat connect socket dari UI | Mode socket terlalu ketat | `chmod 0666 /var/run/hermes-helper.sock` di Helper startup |
+| Tunnel up tapi tidak ada handshake | Firewall block UDP outbound | Test `nc -uvz <gateway> 51820` |
+| App freeze saat klik Connect | Helper crash | Cek `/var/log/hermes-helper.err.log` |
+| Notarization gagal "hardened runtime" | Lupa `--options runtime` | Re-sign dengan flag |
 
 ---
 

@@ -18,33 +18,29 @@ permalink: /docs/migrasi/
 
 ## 10.1 Filosofi: paralel, bukan big-bang
 
-Sama seperti refactor TRMM, migrasi SASE dilakukan **paralel** — arsitektur baru jalan berdampingan dengan kode lama. Setelah arsitektur baru terbukti stabil di produksi, kode lama dihapus.
+Sama dengan refactor TRMM. Arsitektur baru ditambahkan **berdampingan** dengan kode lama, di-control feature flag. Setelah stabil di produksi, kode lama dihapus.
 
 Manfaat:
-
-- **Rollback gampang** — toggle feature flag
-- **Tidak ada downtime user** — VPN tetap kerja selama migrasi
-- **Bisa bertahap** — refactor satu OS dulu, baru lanjut OS lain
-- **Tim paralel** — backend (Edge Function) tidak block frontend
+- Rollback gampang (toggle flag)
+- VPN user tidak interrupted selama migrasi
+- Bisa bertahap per-OS
+- Tim paralel: ops (sign-off konfirmasi schema existing) + frontend (helper service + UI integration)
 
 ## 10.2 Phase overview
 
-| Phase | Durasi target | Aktivitas | Hasil terlihat |
+> **PENTING:** Tidak ada phase schema migration. Schema Supabase **dilarang diubah** — implementasi pakai kolom existing (`uid`, `configuration`, `assigned_ip`, `sase_slice_id`, `sase_version`) dan RLS yang sudah aktif.
+
+| Phase | Durasi | Aktivitas | Hasil |
 |---|---|---|---|
-| **0** | 1 minggu | Audit code SASE existing | Dokumen state machine + dependency graph |
-| **1** | 1 minggu | Setup Edge Function + DB schema | Edge function deploy, ter-test isolated |
-| **2** | 2 minggu | Implementasi `TunnelSupervisor` (Win + Mac) | Standalone test, belum integrate UI |
-| **3** | 1 minggu | Implementasi `SaseConfigClient` + KeyStore | Standalone, belum integrate |
-| **4** | 1 minggu | `ConnectionService` + UI binding | Tab SASE baru pakai arsitektur baru, masih opt-in via flag |
-| **5** | 1 minggu | Beta + 100% rollout | Production users di arsitektur baru |
-| **6** | 1 minggu | Cleanup IpcComService SASE-related code | Surface area bersih |
-| **Total** | **~8 minggu** | | Production fully migrated |
+| **0** | 1 minggu | Audit code SASE existing + verifikasi schema `user_data` production | Mapping IPC → tujuan baru, format `configuration` confirmed |
+| **1** | 2 minggu | Implementasi `HermesHelperSvc` (Win + Mac) | Build + install standalone, ter-test |
+| **2** | 1 minggu | Implementasi `HelperServiceClient` + `SaseConfigClient` | Standalone test, belum integrate UI |
+| **3** | 1 minggu | `SaseConnectionService` + UI binding | Tab SASE dengan flag `UseNewSaseStack=true` |
+| **4** | 2 minggu | Beta + 100% rollout | Production users di arsitektur baru |
+| **5** | 1 minggu | Cleanup IpcComService SASE-related | Surface area bersih |
+| **Total** | **~7 minggu** | | Production fully migrated |
 
 ## 10.3 Phase 0 — Audit
-
-### Tujuan
-
-Inventarisasi state SASE saat ini.
 
 ### Tugas
 
@@ -52,189 +48,137 @@ Inventarisasi state SASE saat ini.
 
    ```powershell
    cd F:\Upwork\CharlesUSA\HermesNetwork360-Avalonia
-   git grep -nE "WireGuard|wireguard|SASE|sase" -- '*.cs' > audit-sase-callsites.txt
-   git grep -n '"Code".*"SASE"' -- '*.cs' >> audit-sase-callsites.txt
+   git grep -nE "WireGuard|wireguard|SASE|sase" -- '*.cs' > audit-sase.txt
+   git grep -nE '"Code".*"SASE"' -- '*.cs' >> audit-sase.txt
    ```
 
-2. Catat di tabel:
+2. Catat tabel:
 
-   | File:Line | Code IPC | Operasi | Tujuan baru |
-   |---|---|---|---|
-   | `ConfigViewModel.cs:1555` | `Z1398V` SASE Start | Start tunnel | `ConnectionService.ConnectAsync()` |
-   | `ConfigViewModel.cs:390` | (sc query) | Get state | `ConnectionService.RefreshStatusAsync()` |
-   | `ConfigViewModel.cs:716` | `XDR Start` | XDR (di luar scope SASE) | (lihat doc lain) |
+   | File:Line | Operasi sekarang | Tujuan baru |
+   |---|---|---|
+   | `ConfigViewModel.cs:1555` | IPC: SASE Start | `_helperClient.StartTunnelAsync("Hermes")` via `SaseConnectionService.ConnectAsync()` |
+   | `ConfigViewModel.cs:390` | sc query state | `_helperClient.GetStatusAsync("Hermes")` |
+   | `... XDR Start` | (di luar scope SASE) | (lihat doc TRMM) |
 
-3. Dokumentasikan **konfigurasi WireGuard sekarang**:
-   - Format `.conf` di-install di mana?
-   - Public key gateway saat ini
-   - AllowedIPs saat ini
-   - Apakah pakai PSK?
-   - Apakah pakai DNS push?
+3. **Verifikasi schema `user_data` production (read-only — JANGAN ubah):**
 
-4. Mapping role → policy (lihat Bab 3 §3.1.2)
+   ```sql
+   -- Login ke Supabase SQL editor sebagai role yang punya akses read.
+   -- HARUS TIDAK ADA migration / ALTER TABLE / CREATE POLICY yang dijalankan.
 
-### Deliverable
+   -- Konfirmasi kolom yang relevan ada
+   SELECT column_name, data_type
+   FROM information_schema.columns
+   WHERE table_schema='public' AND table_name='user_data'
+     AND column_name IN ('uid','configuration','assigned_ip','sase_slice_id','sase_version');
 
-`audit-sase.md` di repo internal, berisi:
-- Daftar file kode existing yang menyentuh SASE
-- Konfigurasi WireGuard saat ini
-- Mapping role → policy yang disetujui ops
+   -- Konfirmasi RLS aktif + policy "Allow all usage"
+   SELECT relrowsecurity FROM pg_class WHERE relname='user_data';
+   SELECT polname, polcmd FROM pg_policy WHERE polrelid='public.user_data'::regclass;
+
+   -- Inspect format configuration di sample user
+   SELECT length(configuration), position('[Interface]' in configuration),
+          position('[Peer]' in configuration), position('PrivateKey' in configuration)
+   FROM user_data WHERE configuration IS NOT NULL LIMIT 5;
+   ```
+
+4. Konfirmasi dengan ops:
+   - Format `configuration` adalah INI string standar WireGuard (sudah dikonfirmasi: ya)
+   - PrivateKey termasuk di `configuration` (sudah dikonfirmasi: ya)
+   - PSK / MTU / Keepalive di production (sudah dikonfirmasi: tidak ada)
+   - Realtime tidak aktif (sudah dikonfirmasi: tidak)
 
 ### Exit criteria
 
-- [ ] Semua call site SASE teridentifikasi
-- [ ] Konfigurasi sekarang ter-dokumentasi
-- [ ] Sign-off ops & security tentang policy mapping
+- [ ] Mapping IPC → tujuan baru lengkap
+- [ ] Schema `user_data` di-verify (TIDAK diubah)
+- [ ] Format `configuration` confirmed dengan ops
+- [ ] User test punya `configuration` ter-populate
+- [ ] Sign-off security tentang trust model (PrivateKey ada di Supabase, lihat Bab 7 §7.4)
 
-## 10.4 Phase 1 — Edge Function + DB schema
+> **Phase 1 schema migration di-DROP.** Tidak ada migration yang akan dijalankan ke Supabase. Lanjut ke Phase 1 (Helper Service).
 
-### Tujuan
-
-`sase-config` Edge Function siap di staging Supabase, ter-test, belum dipakai client.
-
-### Tugas
-
-1. Apply DB migration:
-
-   ```bash
-   supabase migration new add_sase_tables
-   # paste SQL dari Bab 5 §5.2
-   supabase db push
-   ```
-
-2. Tambah env secret:
-
-   ```bash
-   supabase secrets set SASE_API_URL=...
-   supabase secrets set SASE_API_KEY=...
-   supabase secrets set SASE_GATEWAY_ENDPOINT=n1.ndr24.com:51820
-   supabase secrets set SASE_GATEWAY_PUBLIC_KEY=...
-   supabase secrets set SASE_DEFAULT_DNS=10.0.0.1,1.1.1.1
-   ```
-
-3. Deploy edge function (lihat Bab 5 §5.7):
-
-   ```bash
-   supabase functions new sase-config
-   # tulis index.ts
-   supabase functions deploy sase-config
-   ```
-
-4. Test manual via curl:
-
-   ```bash
-   JWT=$(...)  # dapatkan JWT user test
-   curl -X POST $SB_URL/functions/v1/sase-config \
-     -H "Authorization: Bearer $JWT" \
-     -d '{"device_id":"test","public_key":"<wg-pub>","platform":"windows"}'
-   # Expected: 200 dengan SaseConfigDto
-   ```
-
-5. Test register peer benar-benar muncul di SASE control plane dashboard
-
-### Exit criteria
-
-- [ ] DB migration applied di staging
-- [ ] Edge function deployed
-- [ ] Manual curl test sukses
-- [ ] Peer test muncul di SASE control plane
-- [ ] `sase_audit_log` ter-populate
-
-## 10.5 Phase 2 — TunnelSupervisor
-
-### Tujuan
-
-`ITunnelSupervisor` (Win + Mac) terimplementasi, ter-test standalone.
+## 10.4 Phase 1 — Hermes Helper Service
 
 ### Tugas
 
-1. Buat folder `HermesNetwork/Sase/Supervisor/` per spec di Bab 4
-2. Implementasi `WindowsTunnelSupervisor` + `MacTunnelSupervisor`
-3. Unit test dengan `FakeTunnelSupervisor` mock
-4. Integration test:
+1. Buat project `HermesHelperSvc` baru di solution
+2. Implementasi `JsonRpcServer`, `IOsBackend`, `WindowsBackend`, `MacBackend`, `CallerAuthenticator` per [Bab 4]({{ site.baseurl }}{% link docs/04-tunnel-supervisor.md %})
+3. Unit test semua handler
+4. Integration test: install Helper di VM bersih, dari script test panggil verb-verb
 
-   **Windows:**
+   **Windows (test script PowerShell):**
    ```powershell
-   # Generate config dummy
-   $priv = & "C:\Program Files\WireGuard\wg.exe" genkey
-   # ... build dummy .conf, manual register di gateway ...
+   $pipe = New-Object IO.Pipes.NamedPipeClientStream(
+     ".", "HermesHelper", "InOut", "Asynchronous")
+   $pipe.Connect(5000)
 
-   # Test via supervisor
-   dotnet run --project HermesNetwork.SupervisorTest -- apply $config
-   dotnet run --project HermesNetwork.SupervisorTest -- start
-   & "C:\Program Files\WireGuard\wg.exe" show
-   dotnet run --project HermesNetwork.SupervisorTest -- stop
-   dotnet run --project HermesNetwork.SupervisorTest -- uninstall
+   $req = '{"jsonrpc":"2.0","id":"1","method":"Ping"}'
+   $bytes = [Text.Encoding]::UTF8.GetBytes($req)
+   $hdr = [BitConverter]::GetBytes([Net.IPAddress]::HostToNetworkOrder($bytes.Length))
+   $pipe.Write($hdr, 0, 4)
+   $pipe.Write($bytes, 0, $bytes.Length)
+   # ... read response
    ```
 
-5. Code review
+5. Manual integration test: install Helper, lalu test full flow apply config + start + status
 
 ### Exit criteria
 
-- [ ] CI hijau
-- [ ] Unit test coverage >= 80%
+- [ ] CI build hijau (Win + Mac)
+- [ ] Unit test coverage ≥ 80%
 - [ ] Integration test sukses Win + Mac
-- [ ] PR `feature/sase-tunnel-supervisor` merged
+- [ ] Code review approved
+- [ ] Helper signed dengan Authenticode (Win) + Developer ID (Mac)
 
-## 10.6 Phase 3 — SaseConfigClient + KeyStore
-
-### Tujuan
-
-Layer 2 lengkap; client bisa request config dari Edge Function dan cache keypair.
+## 10.5 Phase 2 — Client side: `HelperServiceClient` + `SaseConfigClient`
 
 ### Tugas
 
-1. Implementasi `KeyStore` (Win DPAPI + Mac mode 0600)
-2. Implementasi `KeyPairGenerator` (panggil `wg genkey` / `wg pubkey`)
-3. Implementasi `DeviceIdHelper`
-4. Implementasi `SaseConfigClient`
-5. Integration test:
+1. Buat folder `HermesNetwork/Sase/Helper/` + `HermesNetwork/Sase/Config/`
+2. Implementasi `HelperServiceClient` (named-pipe / unix-socket)
+3. Implementasi `SaseConfigClient` (passthrough INI dari `user_data.configuration`; tidak ada KeyStore karena admin yang manage keypair)
+4. Test integration dengan staging Supabase + Helper di VM:
 
    ```csharp
    [Fact]
-   public async Task RequestConfigAsync_ReturnsValidConfig()
+   public async Task EndToEnd_GetConfigThenApplyToHelper()
    {
-       // Setup: real Supabase staging + JWT user test
-       var config = await client.RequestConfigAsync();
-       config.Peers.Should().HaveCount(1);
-       config.Peers[0].PresharedKey.Should().NotBeNullOrEmpty();
+       var config = await _configClient.GetConfigAsync();
+       config.Should().NotBeNullOrWhitespace();
+       await _helperClient.ApplyConfigAsync("Hermes", config);
+       var st = await _helperClient.GetStatusAsync("Hermes");
+       st.State.Should().BeOneOf("Stopped", "Up");   // tergantung apakah service ter-install
    }
    ```
 
 ### Exit criteria
 
-- [ ] Test integration end-to-end ke staging Supabase berhasil
-- [ ] KeyStore round-trip (save → load) works di Win + Mac
+- [ ] Standalone test panggil Supabase + Helper berhasil
+- [ ] PostgREST query ke `user_data` dengan JWT user mengembalikan row dengan `configuration` valid (sanity check via curl)
 - [ ] PR merged
 
-## 10.7 Phase 4 — ConnectionService + UI
-
-### Tujuan
-
-UI tab SASE pakai arsitektur baru (di balik feature flag).
+## 10.6 Phase 3 — `SaseConnectionService` + UI
 
 ### Tugas
 
-1. Implementasi `SaseConnectionService` per Bab 6
-2. Refactor `SaseTabViewModel` untuk pakai service baru
-3. Tambah feature flag di `appsettings.json`:
+1. Implementasi `SaseConnectionService` per [Bab 6]({{ site.baseurl }}{% link docs/06-connection-flow.md %})
+2. Refactor `SaseTabViewModel` (atau tab lain yang punya tombol Connect SASE) untuk pakai `SaseConnectionService`
+3. Tambah feature flag `appsettings.json`:
 
    ```json
-   {
-     "FeatureFlags": {
-       "UseNewSaseStack": false
-     }
-   }
+   { "FeatureFlags": { "UseNewSaseStack": false } }
    ```
 
-4. Wire DI:
+4. DI registration:
 
    ```csharp
    if (config.FeatureFlags.UseNewSaseStack)
    {
-       services.AddSingleton<ISaseConnectionService, SaseConnectionService>();
-       services.AddSingleton<ITunnelSupervisor>(_ => TunnelSupervisorFactory.Create("Hermes"));
+       services.AddSingleton<IHelperServiceClient, HelperServiceClient>();
        services.AddSingleton<ISaseConfigClient, SaseConfigClient>();
+       services.AddSingleton<ISaseConnectionService, SaseConnectionService>();
+       // Tidak ada KeyStore — keypair di-manage admin di user_data.configuration
    }
    else
    {
@@ -242,120 +186,111 @@ UI tab SASE pakai arsitektur baru (di balik feature flag).
    }
    ```
 
-5. Test UI di Win + Mac dengan flag `true`
+5. Manual test toggle flag → swap behavior
 
 ### Exit criteria
 
-- [ ] Toggle flag → swap behavior, no crash
-- [ ] Connect → Disconnect → Reconnect cycle bekerja di kedua OS
-- [ ] State indicator UI update real-time
-- [ ] Background monitor active saat tab dibuka
+- [ ] Flag `false` → behavior lama identik
+- [ ] Flag `true` → flow baru jalan end-to-end di Win + Mac
+- [ ] State update real-time di UI (StateChanges subscription)
+- [ ] No crash saat toggle flag
+- [ ] Network change handler bekerja
 
-## 10.8 Phase 5 — Beta + 100% rollout
+## 10.7 Phase 4 — Beta + 100% rollout
 
 ### Strategi
 
-1. **Internal QA** (1 minggu) — flag `true` di staging, semua tester pakai SASE baru
-2. **Beta release** (1 minggu) — 5% production users dapat flag `true`
-3. **Monitor**:
-   - Connect success rate >= 95%?
-   - Avg time-to-connect < 10 detik?
-   - Disconnect rate per hour < 1%?
-4. **100% rollout** kalau metric OK
-5. **Rollback** kalau ada issue:
+1. **Internal QA** 1 minggu — flag `true` di staging
+2. **Beta** 1 minggu — 5% production users dengan flag `true`
+3. **Monitor metrics**:
+   - SASE connect success rate
+   - Time-to-handshake
+   - Disconnect rate per hour
+   - Helper IPC error rate
+4. **100% rollout** kalau metric stable
+5. **Rollback** plan: hot-fix release dengan flag default `false`
 
-   ```json
-   { "FeatureFlags": { "UseNewSaseStack": false } }
-   ```
+### Telemetry
 
-   Push update kecil yang flip flag → user reload app → kembali ke legacy.
+Push event ke app log lokal (tabel `sase_audit_log` tidak ada — schema dilarang diubah). Kalau perlu sentralisasi audit, pakai `LogReportService` yang sudah ada (lihat bab 7 §7.10):
 
-### Telemetry yang di-track
+- `connect.attempt`, `connect.success`, `connect.timeout`, `connect.error`
+- `disconnect.user`, `disconnect.unexpected`
+- `reconnect.auto.success`, `reconnect.auto.fail`
+- `helper.rpc.error.<code>`
 
-- `sase.connect.attempt` (count)
-- `sase.connect.success` (count)
-- `sase.connect.duration_seconds` (histogram)
-- `sase.connect.failure.{reason}` (count)
-- `sase.disconnect.unexpected` (count)
-- `sase.handshake.stale_detected` (count)
-- `sase.config.refresh.success` (count)
-- `sase.config.refresh.failure` (count)
-
-Push ke Supabase `telemetry_events` table atau Sentry.
+Query Supabase periodic untuk monitor.
 
 ### Exit criteria
 
 - [ ] 100% rollout sukses 1 minggu tanpa rollback
-- [ ] Metric stable
-- [ ] Tidak ada user complaint signifikan
+- [ ] Connect success rate ≥ 95%
+- [ ] No user complaint signifikan
 
-## 10.9 Phase 6 — Cleanup
-
-### Tujuan
-
-Hapus kode SASE lama yang sudah tidak terpakai.
+## 10.8 Phase 5 — Cleanup
 
 ### Tugas
 
 1. Verifikasi tidak ada reference legacy:
 
    ```bash
-   git grep "LegacySaseConnectionService"   # harus 0 hits
-   git grep '"Code".*"SASE"'                # harus 0 hits
-   git grep "ExecuteSaseButton" -- '*.cs'   # 0 hits
+   git grep "LegacySaseConnectionService"      # 0 hits
+   git grep '"Code".*"SASE"' -- '*.cs'         # 0 hits
+   git grep "ExecuteSaseButton" -- '*.cs'      # 0 hits
    ```
 
 2. Hapus file:
-
    ```
    HermesNetwork/Service/SaseLegacyHandler.cs
-   HermesNetwork/Sase.Old/                  (kalau ada folder lama)
+   HermesNetwork/Sase.Old/                     (jika ada)
    ```
 
-3. Hapus feature flag `UseNewSaseStack` (selalu true sekarang)
-4. Hapus binary path lama yang tidak relevan dari installer
-5. Update README + dokumentasi internal
+3. Hapus feature flag `UseNewSaseStack`
+4. **Catatan**: ServiceEngine.exe **tetap** ada selama masih dipakai oleh komponen lain (XDR, dll). Setelah refactor TRMM + SASE selesai, ServiceEngine bisa di-evaluate untuk dihapus.
 
 ### Exit criteria
 
-- [ ] CI hijau setelah cleanup
-- [ ] Release notes mention "SASE rewrite — better key rotation, identity-aware policy"
+- [ ] CI hijau
+- [ ] Release notes mention "SASE rewrite — Helper Service + Supabase user_data direct"
 - [ ] 1 minggu produksi tanpa regression
 
-## 10.10 Rollback strategy per phase
+## 10.9 Rollback strategy per phase
 
 | Phase | Rollback |
 |---|---|
-| 0 | N/A (audit only) |
-| 1 | Drop schema kolom (kalau memungkinkan), undeploy edge function |
+| 0 | N/A (audit only — tidak ada perubahan) |
+| 1 | Uninstall Helper Service via installer; revert PR |
 | 2 | Revert PR; arsitektur lama tetap pakai IPC |
-| 3 | Revert PR |
-| 4 | Toggle feature flag false; force release update kalau crash |
-| 5 | Hot-fix release dengan flag default false |
-| 6 | Restore dari git history (legacy code masih ada di history) |
+| 3 | Toggle feature flag `false` |
+| 4 | Hot-fix release flag default `false` |
+| 5 | Restore kode lama dari git history |
 
-## 10.11 Risk register
+> Tidak ada rollback DB karena tidak ada DB change.
+
+## 10.10 Risk register
 
 | Risk | Probability | Impact | Mitigation |
 |---|---|---|---|
-| WireGuard binary belum terinstall di endpoint user | Medium | High | Bundle di installer, check di first run |
-| User block UAC dialog (Windows) atau osascript dialog (Mac) | High | Medium | Educate user, retry mechanism |
-| SASE control plane API tidak match expected response | High | High | Comprehensive integration test sebelum 100% rollout |
-| Config refresh terlalu sering → spike load di Edge Function | Low | Medium | Caching di client, exponential back-off |
-| Mac code signing expire | Low | Critical | Calendar reminder 30 hari sebelum |
-| Conflict dengan VPN client lain (Cisco AnyConnect, etc.) | Medium | High | Document incompatibility, detection check di startup |
+| Helper Service tidak terinstall di endpoint user | Medium | High | Bundle di installer, check Ping di startup |
+| Permission issue caller authentication | Medium | Medium | Comprehensive testing multi-user scenarios |
+| `configuration` di `user_data` format inkonsisten antar user (mis. ada user yang INI tidak valid) | Medium | High | Validator di `SaseConfigClient.GetFullAsync()` cek `[Interface]` + `[Peer]` ada; fail early dengan pesan jelas. Hubungi admin untuk fix populate. |
+| Apple Developer ID expire | Low | Critical | Calendar reminder 30 hari |
+| Conflict dengan VPN client lain (NordVPN, dll.) | Medium | Medium | Document incompatibility, detect saat startup |
 | Kill switch terlalu agresif → user lock out | Medium | High | Default soft-fail; opt-in kill switch per role |
+| Realtime subscription tidak available di self-hosted | Medium | Low | Fallback ke polling 5 menit |
 
-## 10.12 Definition of Done
+## 10.11 Definition of Done
 
-Migrasi dianggap **selesai** kalau:
+Migrasi **selesai** kalau:
 
-- [ ] Phase 0–6 semua exit criteria centang
-- [ ] `LegacySaseConnectionService` (atau setara) sudah dihapus dari main branch
-- [ ] Feature flag `UseNewSaseStack` sudah dihilangkan
+- [ ] Phase 0–6 semua exit criteria tercentang
+- [ ] `LegacySaseConnectionService` dihapus dari main
+- [ ] Feature flag `UseNewSaseStack` dihilangkan
 - [ ] Telemetry produksi 2 minggu menunjukkan no increase di error rate
 - [ ] Onboarding doc tim engineering update
 - [ ] Tidak ada call IPC custom yang menyentuh SASE
+- [ ] Helper Service signed + notarized untuk Mac, Authenticode signed untuk Win
+- [ ] **Konfirmasi: TIDAK ADA migration / `ALTER TABLE` / trigger / policy baru yang dijalankan ke Supabase production.** Schema `user_data` tetap apa adanya.
 
 ---
 

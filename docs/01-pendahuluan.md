@@ -18,44 +18,31 @@ permalink: /docs/pendahuluan/
 
 ## 1.1 Konteks: SASE di Hermes Network 360 Guard
 
-**Hermes Network 360 Guard** adalah aplikasi desktop cross-platform (Windows + macOS) berbasis Avalonia (.NET 8). Salah satu komponen utamanya adalah **SASE** — *Secure Access Service Edge* — yang memberikan tunnel terenkripsi dari endpoint user ke gateway perusahaan, sehingga semua trafik yang ditarget (atau seluruh trafik, tergantung policy) lewat sana dengan inspeksi NGFW dan policy enforcement terpusat.
+**Hermes Network 360 Guard** adalah aplikasi desktop cross-platform (Windows + macOS) berbasis Avalonia (.NET 8). Salah satu komponen utamanya adalah **SASE** — *Secure Access Service Edge* — yang memberikan tunnel terenkripsi dari endpoint user ke gateway perusahaan.
 
-Implementasi SASE di Hermes saat ini menggunakan **WireGuard** sebagai data plane:
+Implementasi SASE di Hermes saat ini menggunakan **WireGuard** sebagai data plane. **Konfigurasi WireGuard per-user** disimpan di Supabase di tabel `user_data` — saat user login, aplikasi membaca konfigurasinya dan apply ke tunnel di endpoint.
 
-- Lightweight (~4000 LoC kernel module)
-- Sangat cepat (kernel-mode di Win/Linux, NetworkExtension di Mac)
-- Crypto modern (Curve25519, ChaCha20-Poly1305, BLAKE2s)
-- Sederhana (config = INI file, `[Interface]` + `[Peer]` blocks)
-- Stateless di kernel (data plane), kontrol via userspace tools
-
-Gateway SASE Hermes dideploy di `n1.ndr24.com` (terlihat di log `app.log`).
+> **Penting (terkait konteks deployment):**
+> - **Supabase yang dipakai adalah self-hosted**, sehingga fitur **Supabase Edge Functions tidak tersedia**. Komunikasi backend dilakukan langsung ke Postgres via PostgREST (RLS-protected) atau lewat REST service terpisah jika dibutuhkan logic server-side.
+> - **`HermesNetwork360Guard.exe` jalan sebagai user biasa, bukan as administrator.** Operasi privileged (install tunnel service, write config, start/stop tunnel) **harus dilakukan oleh komponen helper terpisah** yang punya privilege SYSTEM (Windows) atau root (macOS).
+> - **Tidak ada gateway SASE terpusat dengan IP/hostname tunggal.** Tiap user punya konfigurasi WireGuard sendiri — endpoint, peer pubkey, AllowedIPs, dan PrivateKey — tersimpan di kolom `user_data.configuration` (text, full WireGuard INI string) di Supabase production.
+> - **Schema Supabase TIDAK boleh diubah** dalam scope implementasi ini. Tidak ada migration, tidak ada `ALTER TABLE`, tidak ada kolom baru. Implementasi harus pakai kolom yang sudah ada.
 
 ## 1.2 Apa itu SASE?
 
-SASE adalah pola arsitektur jaringan yang menggabungkan:
+SASE adalah pola arsitektur jaringan yang menggabungkan VPN client + secure web gateway + ZTNA + NGFW di satu service edge. Untuk Hermes, scope yang kita refactor di dokumen ini adalah:
 
-- **SD-WAN / VPN client** (data plane) → WireGuard di kasus kami
-- **Secure Web Gateway** (URL filtering, malware scan)
-- **CASB** (Cloud Access Security Broker)
-- **Zero Trust Network Access (ZTNA)** (identity-aware access)
-- **NGFW** (Next-Gen Firewall)
+- **Data plane**: WireGuard (kernel-mode di Win, NetworkExtension/wireguard-go di Mac)
+- **Config plane**: Supabase `user_data` table sebagai source of truth per-user config
+- **Local control plane**: Hermes Helper Service untuk eksekusi operasi privileged
 
-Untuk Hermes, scope SASE yang kita refactor di dokumen ini adalah **data plane (WireGuard) + control plane (config + policy)**. NGFW dan content inspection ada di gateway, tidak di-touch.
-
-```mermaid
-flowchart LR
-    USER[User Endpoint<br/>Hermes Guard]
-    WG[WireGuard Tunnel]
-    GW[SASE Gateway<br/>n1.ndr24.com]
-    NGFW[NGFW + Inspection]
-    INET[Internet / SaaS]
-
-    USER --> WG --> GW --> NGFW --> INET
-```
+Yang **bukan** scope:
+- Provisioning gateway / register peer di gateway (di-handle terpisah oleh ops/admin yang populate `user_data`)
+- NGFW dan content inspection di gateway
 
 ## 1.3 Implementasi saat ini
 
-Berdasarkan audit kode (`HermesNetwork/Service/IpcComService.cs`, `ConfigViewModel.cs`, dan log produksi) dan log aplikasi:
+Berdasarkan audit kode (`HermesNetwork/Service/IpcComService.cs`, `ConfigViewModel.cs`, log produksi):
 
 ```
 07/11/2025 11:08:17.298 AM ConfigViewModel.cs ExecuteSaseButton:1555 -
@@ -66,126 +53,108 @@ Berdasarkan audit kode (`HermesNetwork/Service/IpcComService.cs`, `ConfigViewMod
 
 Komponen yang ada:
 
-1. **WireGuard tunnel service** — Windows service yang dikelola oleh `wireguard.exe` (`/installtunnelservice`)
-2. **Custom IPC** — UI Avalonia → `ServiceEngine.exe` lewat named-pipe / TCP localhost dengan JSON ad-hoc
-3. **`ConfigViewModel`** — handle button SASE, query state via `sc.exe` (Windows Service Manager)
-4. **Konfigurasi statis** — `.conf` file di-generate saat install dari payload yang di-encode base64
+1. **WireGuard tunnel service** — Windows service `WireGuardTunnel$<name>` yang di-host oleh binary Hermes sendiri (lewat embedded `tunnel.dll` P/Invoke; bukan `wireguard.exe` external)
+2. **`ServiceEngine.exe`** — Windows Service custom (jalan as SYSTEM) yang manage operasi privileged seperti install/start/stop WireGuard
+3. **Custom IPC** — UI Avalonia → ServiceEngine via named-pipe JSON ad-hoc dengan magic strings (`Code: "Z1398V"`, dst.)
+4. **`ConfigViewModel`** — handle button SASE, query state via `sc.exe`
+5. **Konfigurasi statis** — di-install dari payload yang sudah di-encode
 
 Aliran tipikal "user klik tombol Connect SASE":
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant UI as Avalonia UI
-    participant SE as ServiceEngine.exe
-    participant WG as WireGuard Tunnel<br/>Service (Windows)
-    participant GW as SASE Gateway
+    participant UI as Avalonia UI<br/>(user mode)
+    participant SE as ServiceEngine.exe<br/>(SYSTEM)
+    participant WG as WireGuard Tunnel<br/>(per-tunnel service)
 
     U->>UI: Klik "Connect SASE"
     UI->>SE: IPC: { Code: "Z1398V", Service: "SASE", Arg: "Start", Config: "..." }
     SE->>WG: sc start WireGuardTunnel$<TunnelName>
-    WG->>GW: WireGuard handshake
-    GW-->>WG: handshake OK
     WG-->>SE: Service started
-    SE-->>UI: { Status: true, Message: "..." }
-    UI-->>U: Update UI to "Connected"
+    SE-->>UI: { Status: true }
+    UI-->>U: "Connected"
 ```
 
-## 1.4 Masalah dengan implementasi saat ini
+## 1.4 Masalah pada implementasi saat ini
 
-### 1.4.1 Konfigurasi statis, sulit di-rotate
+### 1.4.1 Custom IPC tanpa kontrak
 
-Config `.conf` WireGuard di-generate saat install dengan key + peer detail di-hardcode. Untuk:
+UI berkomunikasi dengan ServiceEngine lewat named-pipe JSON dengan magic strings (`Code: "DL2KNT"`, `Code: "Z1398V"`, dst.):
 
-- Rotate kunci: generate ulang, push ke setiap client manual, restart tunnel
-- Ganti gateway IP: redeploy installer
-- Ubah AllowedIPs: redeploy installer
+- Tidak versioned, tidak schema-validated, tidak self-documenting
+- Susah test (perlu running ServiceEngine.exe)
+- Bug typo di `Config` baru ketahuan saat agent crash
 
-Tidak ada cara user/admin untuk **refresh config dari backend** saat aplikasi jalan.
+> Catatan: di refactor TRMM (lihat [panduan TRMM](https://ardika.github.io/hermes-trmm-docs/)), kita hilangkan ServiceEngine.exe karena operasinya bisa lewat REST API. Untuk SASE, **kita tetap perlu komponen privileged** karena UI tidak run as admin dan WireGuard butuh privilege untuk install/start service. Solusinya: ganti ServiceEngine yang opaque dengan **Hermes Helper Service** dengan kontrak typed dan scope minimal.
 
-### 1.4.2 Tidak ada identity-aware policy
+### 1.4.2 UI tidak run as admin
 
-Semua user di organisasi yang sama dapat config WireGuard yang **identik**. Implikasinya:
+`HermesNetwork360Guard.exe` distribute ke end-user dan jalan dalam konteks user biasa. Operasi WireGuard yang butuh admin:
 
-- Tidak bisa beda-beda AllowedIPs per role (HR vs Engineer)
-- Tidak bisa revoke akses individu tanpa rotate key untuk semua orang
-- Audit log "siapa yang masuk ke server X" sulit dibangun karena semua peer pakai source IP yang sama
-- Compromised laptop = compromise akses semua orang sampai key di-rotate global
+| Operasi | Butuh admin? |
+|---|---|
+| Register Windows Service `WireGuardTunnel$<name>` (via `Service.Add()` → `Win32.OpenSCManager` + `CreateService`, embedded di `TunnelDll/`) | ✅ Ya (install service baru) |
+| Write config ke `C:\Program Files\WireGuard\Data\Configurations\` | ✅ Ya |
+| `sc start WireGuardTunnel$Hermes` | ✅ Ya (dengan SCM access) |
+| `wg show` (read status) | ❌ Tidak (di Mac); ya sebagian (di Win, butuh akses pipe) |
+| Apply config baru (replace file + restart service) | ✅ Ya |
 
-### 1.4.3 Custom IPC yang sama dengan TRMM
+Kalau kita force UAC dialog tiap kali user klik Connect/Disconnect, UX akan sangat buruk. Solusi: **Hermes Helper Service** yang sekali install (oleh installer dengan elevation), terus jalan sebagai SYSTEM/root, dan UI request operasi via IPC.
 
-Sama seperti masalah di TRMM (lihat [Panduan TRMM](https://ardika.github.io/hermes-trmm-docs/)):
+### 1.4.3 State drift
 
-- Magic strings (`Code: "Z1398V"`)
-- Tidak versioned
-- Tidak schema-validated
-- Sulit di-test
+State agent (online/offline) di-track di UI dan service tanpa single source of truth — bisa drift.
 
 ### 1.4.4 Tidak ada PSK (Pre-Shared Key)
 
-Config WireGuard standar Hermes tidak pakai PSK. Tanpa PSK, kalau private key bocor ke attacker, attacker bisa langsung masuk ke gateway. Dengan PSK, attacker butuh **dua** secret (private key + PSK) untuk berhasil handshake.
+Config WireGuard production saat ini tidak pakai PSK (verified dari sample 5 user real: `PresharedKey` tidak ada). Tanpa PSK, kalau private key bocor, attacker langsung bisa handshake. PSK akan menambah defense-in-depth tapi keputusan tambah PSK adalah keputusan ops + admin tooling, bukan client.
 
-WireGuard mendukung PSK out-of-the-box; ini jelas tertinggal.
+Implementasi client passthrough INI apa adanya — kalau ke depan admin tambah `PresharedKey = ...` di `[Peer]` block, tidak perlu code change.
 
 ### 1.4.5 Reconnection / roaming brittle
 
-WireGuard self-heal kalau IP user berubah (laptop pindah dari WiFi ke 4G), tapi:
-
-- Kalau **endpoint gateway** berubah (failover ke backup gateway), client harus dapat config baru
-- Kalau koneksi drop > 3 menit, beberapa state-aware NAT membuang flow → user harus manual disconnect/connect
-- Aplikasi tidak punya health check yang aktif memeriksa "tunnel up tapi tidak ada handshake terbaru"
+Tidak ada health check aktif yang detect "tunnel up tapi handshake lama" → user harus manual disconnect/connect.
 
 ### 1.4.6 DNS leak risk
 
-Default config WireGuard di Windows tidak otomatis set DNS resolver dalam tunnel; user perlu specify `DNS = ...` di interface block. Kalau tidak, request DNS bocor ke ISP user.
+Default config tidak otomatis push DNS resolver dalam tunnel; request DNS bocor ke ISP user.
 
-### 1.4.7 Split-tunnel hardcoded
+### 1.4.7 Tidak ada audit/observability
 
-Allow IPs yang menentukan trafik mana yang lewat tunnel di-set saat install. Mau ubah dari full-tunnel ke split-tunnel (atau sebaliknya)? Generate ulang installer.
-
-### 1.4.8 Tidak ada audit/observability
-
-Tidak ada laporan ke backend tentang:
-
-- Kapan user connect / disconnect
-- Berapa lama tunnel up
-- Berapa byte transfer
-- Apakah ada handshake failures
-- IP publik client saat connect (untuk audit kalau ada incident)
+Tidak ada laporan ke Supabase tentang connect time, last handshake, byte transfer, errors — sulit untuk audit dan debug.
 
 ## 1.5 Target setelah refactor
 
-Setelah refactor sesuai dokumen ini, Anda akan punya:
-
 | Aspek | Sebelum | Sesudah |
-|-------|---------|---------|
-| Config delivery | Hardcoded di installer | Dari Edge Function, per-device, expire 24 jam |
-| Identity-aware | Semua user sama | AllowedIPs + DNS per role |
-| Key rotation | Manual, redeploy | Automated, transparent ke user |
-| PSK | Tidak ada | Auto-generated per peer |
+|---|---|---|
+| Helper service | `ServiceEngine.exe` opaque, JSON ad-hoc | `HermesHelperSvc` typed JSON-RPC, scope minimal |
+| Config delivery | Hardcoded saat install | Read dari Supabase `user_data` saat login + on-demand refresh |
+| Privileged ops | Disebar di multiple kode IPC | Hanya di Helper Service, well-defined verbs |
 | Roaming detection | Tidak ada | Active health check + reconnect |
-| Split-tunnel | Statis | Dinamis dari role policy |
-| Audit log | Tidak ada | Full di Supabase + SASE control plane |
-| Custom IPC | Required | Hilang — pakai stdlib + HTTPS |
+| PSK | Tidak ada di production | (TIDAK diubah dalam scope ini — keputusan ops kalau mau tambah PSK di admin tooling) |
+| Audit log | Tidak ada | Connect events di app log lokal + (opsional) Hermes `LogReportService` existing |
+| State source of truth | Local (drift) | `user_data.configuration` (Supabase) + helper status query |
 
 ## 1.6 Apa yang BUKAN cakupan
 
-- Setup awal SASE gateway (sudah ada di `n1.ndr24.com`)
-- Konfigurasi NGFW / packet inspection di gateway
-- Migrasi dari WireGuard ke teknologi lain (mis. OpenZiti, NetBird, Tailscale) — kita **tetap pakai WireGuard**, hanya tambah control plane di atasnya
-- Throughput tuning kernel WireGuard
+- Setup awal gateway WireGuard (server-side WireGuard) — di-manage ops/admin
+- Provisioning per-user WG config di `user_data.configuration` (di-populate via tooling admin di luar app)
+- **Perubahan schema Supabase** — schema dilarang diubah dalam scope ini
+- NGFW / packet inspection di gateway
+- Migrasi ke teknologi VPN lain (kita **tetap pakai WireGuard**)
 - UI/UX redesign Avalonia
 
 ## 1.7 Tujuan dokumen
 
 Setelah membaca dan menerapkan dokumen ini, Anda akan:
 
-1. Memahami **arsitektur tiga-lapis** untuk SASE: TunnelSupervisor + ConfigClient + ConnectionService
-2. Bisa mengimplementasikan **`ITunnelSupervisor`** (Windows + macOS) untuk lifecycle WireGuard tunnel
-3. Bisa mengimplementasikan **`SaseConfigClient`** + Edge Function untuk per-device config provisioning
-4. Memahami strategi **key rotation, PSK, dan identity-aware AllowedIPs**
-5. Tahu cara **migrasi inkremental** dari implementasi sekarang ke arsitektur baru
-6. Bisa **debug masalah WireGuard umum** (tidak handshake, DNS leak, MTU, dll.)
+1. Memahami **arsitektur tiga-lapis baru**: UI + HelperService + Supabase
+2. Bisa mengimplementasikan **Hermes Helper Service** dengan typed JSON-RPC contract (Win + Mac)
+3. Bisa mengimplementasikan **`SaseConfigClient`** yang query `user_data` Supabase langsung (tanpa Edge Function)
+4. Bisa mengimplementasikan **`SaseConnectionService`** yang orkestrasi UI ↔ Helper
+5. Memahami strategi **migrasi inkremental** dari ServiceEngine yang ada sekarang
+6. Tahu cara **debug masalah WireGuard** umum
 
 ---
 
